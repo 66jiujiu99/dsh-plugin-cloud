@@ -98,6 +98,47 @@ check('非法输入返回 null', v.githubSlug(null) === null);
 	check('checkUpdates 不支持时不可更新', tar.updateAvailable === false);
 }
 
+// ── githubSlug 必须认全 npm 的 git 写法 ─────────────────────
+// 这组是回归测试：`installBundle` 安装 git 依赖后会把 spec 改写成
+// `git+https://github.com/o/r.git#sha`，而最初的 githubSlug 只认
+// `github:` / `https://` 等几种形态，于是「转为订阅」成功后 slug 变 null、
+// 插件永久显示「无法检查」。订阅这个动作为了能查更新，结果让检查失效了。
+{
+	const same = '66jiujiu99/dsh-plugin-session-restore';
+	const forms = [
+		[`github:${same}#62c24020`, 'github: 简写'],
+		[`git+https://github.com/${same}.git#62c24020`, 'git+https（installBundle 写的形态）'],
+		[`git+https://github.com/${same}.git`, 'git+https 无 ref'],
+		[`https://github.com/${same}.git`, 'https'],
+		[`https://github.com/${same}`, 'https 无 .git'],
+		[`git+ssh://git@github.com/${same}.git#abc`, 'git+ssh'],
+		[`git@github.com:${same}.git`, 'scp 风格'],
+		[`git://github.com/${same}.git`, 'git 协议'],
+	];
+	for (const [spec, label] of forms) {
+		check(`githubSlug 认得 ${label}`, v.githubSlug(spec) === same, `${v.githubSlug(spec)} <- ${spec}`);
+	}
+
+	// 反向：非 GitHub 的不能被误认成 GitHub
+	for (const spec of [
+		'not-a-github-spec',
+		'https://gitlab.com/o/r.git',
+		'git+https://bitbucket.org/o/r.git',
+		'registry-pkg@1.2.3',
+		'link:C:/local/dir',
+	]) {
+		check(`githubSlug 不误认 ${spec}`, v.githubSlug(spec) === null, String(v.githubSlug(spec)));
+	}
+
+	// 最关键的一条：真实订阅后的 spec 必须能通过 checkGitDependency，
+	// 而不是落进 unsupported-spec。这是用户实际遇到的失败。
+	const realSpec = 'git+https://github.com/octocat/Hello-World.git#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+	const realInfo = await v.checkGitDependency({ name: 'probe', spec: realSpec, version: '0.0.0' }, { branch: 'master' });
+	check('installBundle 写回的 git+https spec 不再标 unsupported',
+		realInfo.note !== 'unsupported-spec', JSON.stringify(realInfo));
+	check('该 spec 能解析出 slug', realInfo.slug === 'octocat/Hello-World', String(realInfo.slug));
+}
+
 // ── checkUpdates 对 git 依赖必须真的检查 ────────────────────
 // 这组是回归测试：`github:owner/repo#sha` 曾经落进「unsupported-spec」，
 // 于是每个刚订阅成功的插件都永久显示「无法检查」——订阅的全部意义就是能查更新。
