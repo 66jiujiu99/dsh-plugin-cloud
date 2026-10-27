@@ -101,33 +101,35 @@ check('非法输入返回 null', v.githubSlug(null) === null);
 // ── checkUpdates 对 git 依赖必须真的检查 ────────────────────
 // 这组是回归测试：`github:owner/repo#sha` 曾经落进「unsupported-spec」，
 // 于是每个刚订阅成功的插件都永久显示「无法检查」——订阅的全部意义就是能查更新。
+//
+// 用公开的、长期稳定的仓库做「真实远端」用例，而不是某台机器上的本地插件：
+// 测试写死本机某个私有仓库的 commit，换台机器就必然失败，公开出去更是跑不了。
 {
-	// 本地分支上的「上游」
-	const sameSha = 'c6c0ad3f0c570522d16e0f6bf1186ef98068b15c';
 	const olderSha = 'a'.repeat(40);
 
-	// 用假的 remoteCommit 验证判定逻辑，不依赖网络
-	const fakeTip = (tip) => async () => tip;
-
-	// 直接测判定函数：把 remoteCommit 换成桩不方便，所以用导出函数的真实签名
-	// ——它接受 plugin 和 options，内部调用 remoteCommit。这里改用依赖注入式的
-	// 单元验证：构造 spec，断言 note 的语义分支。
+	// 直接测判定函数：它接受 plugin 和 options，内部调用 remoteCommit。
 	const { checkGitDependency } = v;
 
 	// (a) slug 解析不出来 → unsupported-spec
 	const noSlug = await checkGitDependency({ name: 'x', spec: 'not-a-github-spec' });
 	check('git 依赖里非 GitHub 的 spec 才标 unsupported', noSlug.note === 'unsupported-spec', JSON.stringify(noSlug));
 
-	// (b) 真实远端可读时，锁定 commit 等于远端 tip → 最新
-	const real = await checkGitDependency({
-		name: 'dsh-plugin-remote-mobile',
-		spec: `github:66jiujiu99/dsh-plugin-remote-mobile#${sameSha}`,
-		version: '0.4.1',
-	});
-	if (real.note === 'remote-unreachable') {
-		skip('git 依赖的远端比对', '网络不可用');
+	// (b) 真实远端：用一个公开且稳定的仓库，先读它的 tip，再用同一个 sha 构造
+	// 一份「锁定值等于 tip」的依赖，断言判定为最新。这样测试不依赖任何本机状态。
+	const probeSlug = 'octocat/Hello-World';
+	// 这个仓库的主分支是 master，不是 main。必须显式传下去：
+	// `checkGitDependency` 默认按 main 比对，探到的 tip 却是 master，两者对不上。
+	const probeBranch = 'master';
+	const tip = await v.remoteCommit(probeSlug, probeBranch);
+	if (tip === null) {
+		skip('git 依赖的远端比对', '网络不可用或该公开仓库不可达');
 	} else {
-		check('git 依赖能读到远端 tip', typeof real.latestCommit === 'string' && real.latestCommit.length === 40, String(real.latestCommit));
+		const real = await checkGitDependency({
+			name: 'probe',
+			spec: `github:${probeSlug}#${tip}`,
+			version: '0.0.0',
+		}, { branch: probeBranch });
+		check('git 依赖能读到远端 tip', real.latestCommit === tip, String(real.latestCommit));
 		// 回归：`latest` 在 registry 语义里是版本号。把它填成 40 位 sha，界面就会
 		// 把 commit 当作版本号渲染在「最新」列——用户看到 `c6c0ad3f…` 会以为
 		// 版本号解析错了。这条断言就是防止那个 bug 回来。
@@ -135,17 +137,16 @@ check('非法输入返回 null', v.githubSlug(null) === null);
 		check('git 依赖不再标 unsupported', real.note !== 'unsupported-spec', String(real.note));
 		check('锁定 commit 等于远端 tip 时判为最新', real.updateAvailable === false, JSON.stringify(real));
 
-		// (c) 锁定一个旧 commit → 应该判为「上游有新提交」
+		// (c) 锁定一个必然不等于 tip 的 commit → 应该判为「上游有新提交」
 		const behind = await checkGitDependency({
-			name: 'dsh-plugin-remote-mobile',
-			spec: `github:66jiujiu99/dsh-plugin-remote-mobile#${olderSha}`,
-			version: '0.4.1',
-		});
+			name: 'probe',
+			spec: `github:${probeSlug}#${olderSha}`,
+			version: '0.0.0',
+		}, { branch: probeBranch });
 		check('锁定的 commit 落后时判为可更新', behind.updateAvailable === true, JSON.stringify(behind));
 		check('落后时给出 upstream-ahead 说明', behind.note === 'upstream-ahead', String(behind.note));
 		check('落后时 latest 依然为空', behind.latest === null, String(behind.latest));
-		check('落后时 latestCommit 是新 tip', typeof behind.latestCommit === 'string' && behind.latestCommit.length === 40,
-			String(behind.latestCommit));
+		check('落后时 latestCommit 是新 tip', behind.latestCommit === tip, String(behind.latestCommit));
 	}
 
 	// (d) 远端读不到 → remote-unreachable，而不是假装最新
@@ -160,8 +161,9 @@ check('非法输入返回 null', v.githubSlug(null) === null);
 	// (e) 接线测试：checkUpdates 必须把 kind==='git' 的插件交给上面的逻辑。
 	// 只测 checkGitDependency 本身是不够的——删掉 checkUpdates 里的 git 分支，
 	// 单测照样全绿（这里之前就漏过一次）。所以必须从 checkUpdates 这一侧验证。
+	// 指向不存在的仓库即可：这条只验证「是否进入 git 分支」，不验证远端内容。
 	const wired = await v.checkUpdates([
-		{ name: 'git-pkg', kind: 'git', version: '0.4.1', spec: `github:66jiujiu99/dsh-plugin-remote-mobile#${sameSha}` },
+		{ name: 'git-pkg', kind: 'git', version: '0.4.1', spec: `github:${probeSlug}#${olderSha}` },
 	]);
 	const gitRow = wired.get('git-pkg');
 	check('checkUpdates 走 git 分支而非 unsupported',

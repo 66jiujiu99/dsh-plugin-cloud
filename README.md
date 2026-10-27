@@ -108,7 +108,7 @@ registry 请求并发上限 6，结果缓存；`refresh=0` 复用缓存，但**�
 
 ```
 link:C:/Data/deepseek/remote-mobile
-  → github:66jiujiu99/dsh-plugin-remote-mobile#c6c0ad3f0c57…
+  → github:owner/repo#c6c0ad3f0c57…
 ```
 
 **固定到具体 commit，不固定到分支**——分支会在安装时解析成当时的 HEAD，
