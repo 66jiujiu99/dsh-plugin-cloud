@@ -1,0 +1,4 @@
+- insert:
+    - id: plugin-cloud
+      name: dsh-plugin-cloud
+      config: {}

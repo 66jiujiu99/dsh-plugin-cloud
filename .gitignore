@@ -1,0 +1,12 @@
+﻿node_modules/
+dist/
+*.log
+.env
+.env.local
+*.bak
+*.mutation-backup
+package.json.*.before-*
+package.json.good-*
+.DS_Store
+# 一次性修复脚本：已完成使命，保留只会有人误跑
+tools/.*.mjs

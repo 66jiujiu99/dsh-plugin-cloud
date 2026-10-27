@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Plugin Cloud",
+    "description": "Automatic backup of this profile's whole plugin set — exact versions, bundle order, enablement and local git plugins — to your private GitHub repository, with one-click version restore."
+  }
+}

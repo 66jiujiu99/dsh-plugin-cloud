@@ -1,0 +1,48 @@
+{
+  "name": "dsh-plugin-cloud",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "description": "插件云：一个插件搞定插件版本管理、自动备份与一键迁移——检查已装插件的更新、一键升级、每次插件变动自动备份，并把本地目录插件转为订阅它的 GitHub 仓库。Plugin version management, automatic backup and one-click migration for a DSH profile.",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "lib/*.js",
+    "locale/*.json",
+    "icon.svg",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "scripts": {
+    "test": "node tools/run-all.mjs",
+    "test:selftest": "node tools/run-selftest.mjs",
+    "test:locale": "node tools/locale-check.mjs",
+    "test:versions": "node tools/versions-check.mjs",
+    "test:table": "node tools/table-check.mjs",
+    "test:metadata": "node tools/metadata-check.mjs",
+    "test:manifest": "node tools/manifest-check.mjs",
+    "test:mutation": "node tools/mutation-check.mjs"
+  }
+}
