@@ -916,7 +916,7 @@ window.__ModuleLoader__.load({
 
 			const doSubscribe = useCallback(async (names) => {
 				if (names.length === 0) return;
-				setBusy('subscribe'); setError(null); setNotice(null);
+				setBusy('subscribe'); setError(null); setNotice(null); setJob(null);
 				try {
 					const res = await fetch(api('/subscribe'), {
 						method: 'POST', credentials: 'same-origin',
@@ -924,13 +924,32 @@ window.__ModuleLoader__.load({
 						body: JSON.stringify({ names }),
 					});
 					const body = await res.json();
+					// 409 carries the job that is already running: adopt it rather than
+					// starting a second pnpm run against the same profile.
+					if (res.status === 409 && body?.job) {
+						setJob(body.job);
+						const final = await pollJob(body.job.id, setJob);
+						if (final !== null) reportBatch(final, t('subscribeFailed'), (vars) => t('subscribeDone', vars));
+						await load(true);
+						return;
+					}
 					if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
-					reportBatch(body, t('subscribeFailed'), (vars) => t('subscribeDone', vars));
+					setJob(body.job ?? null);
+					// Subscribing runs several git commands and then pnpm, so it is a
+					// job like an upgrade: poll it so the panel shows which step is
+					// running instead of an opaque spinner.
+					const final = await pollJob(body.job.id, setJob);
+					if (final === null) {
+						setError(t('jobLost'));
+						await load(true);
+						return;
+					}
+					reportBatch(final, t('subscribeFailed'), (vars) => t('subscribeDone', vars));
 					await load(true);
 				} catch (e) {
 					setError(errorText(t, e?.message ?? e));
-				} finally { setBusy(null); }
-			}, [load, t, lang]);
+				} finally { setBusy(null); setJob(null); }
+			}, [load, t, lang, pollJob]);
 
 			const kindLabel = (p) => {
 				if (p.kind === 'path') return t('nodeLocal');

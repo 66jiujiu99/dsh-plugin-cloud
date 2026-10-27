@@ -12,7 +12,7 @@
  *
  * Run: node tools/jobs-check.mjs
  */
-import { createJobRegistry, stepsFor } from '../lib/jobs.js';
+import { createJobRegistry, stepsFor, subscribeStepsFor } from '../lib/jobs.js';
 
 let passed = 0;
 const check = (label, ok, detail = '') => {
@@ -189,6 +189,42 @@ const check = (label, ok, detail = '') => {
 	snap.results.push({ name: 'injected' });
 	check('改快照不影响内部状态', reg.get(job.id).results.length === 0,
 		String(reg.get(job.id).results.length));
+}
+
+
+// ── 11. 订阅也必须是任务，且有真实步骤 ──────────────────────
+// 订阅原本是同步请求，界面只能转圈：用户看不到在做什么，也分不清是卡住了
+// 还是在装包。改成任务后，步骤必须反映真实管线（检查仓库 → 推导 spec →
+// 改 manifest → pnpm → 校验），而不是编出来的进度条。
+{
+	const steps = subscribeStepsFor('dsh-plugin-session-restore');
+	check('订阅步骤非空', steps.length >= 4, String(steps.length));
+	check('订阅步骤都有 id 和 label', steps.every((s) => typeof s.id === 'string' && typeof s.label === 'string'));
+	check('订阅步骤 id 不重复', new Set(steps.map((s) => s.id)).size === steps.length);
+
+	const ids = steps.map((s) => s.id);
+	// 这几个阶段是订阅真正的管线，少一个界面就会跳过真实工作
+	for (const required of ['inspect', 'plan', 'install']) {
+		check(`订阅步骤包含 ${required}`, ids.includes(required), ids.join(','));
+	}
+	check('订阅步骤包含 pnpm 安装', ids.includes('install'));
+	check('插件名出现在第一步的 label 里', steps[0].label.includes('dsh-plugin-session-restore'), steps[0].label);
+
+	// 订阅与升级是两条不同管线，不能共用步骤 id 序列
+	const upgradeIds = stepsFor('x', null).map((s) => s.id).join(',');
+	const subscribeIds = ids.join(',');
+	check('订阅步骤与升级步骤不同', upgradeIds !== subscribeIds, `${upgradeIds} vs ${subscribeIds}`);
+
+	// 任务机制对订阅同样生效：进度、取消、单任务互斥
+	const reg = createJobRegistry();
+	const job = reg.create({ names: ['p'], stepSets: [subscribeStepsFor('p')] });
+	check('订阅任务初始为 running', job.status === 'running');
+	reg.advance(job.id, { index: 0, stepIndex: 2, phase: 'planning' });
+	const mid = reg.get(job.id);
+	check('订阅任务能报告当前步骤', mid.current === mid.steps[2].id, String(mid.current));
+	check('订阅任务能报告已完成步骤', mid.completedSteps.length === 2, JSON.stringify(mid.completedSteps));
+	check('订阅任务能被取消', reg.cancel(job.id) === true);
+	check('取消后状态仍为 running（步骤间才停）', reg.get(job.id).status === 'running');
 }
 
 console.log(`\n${passed} checks passed`);

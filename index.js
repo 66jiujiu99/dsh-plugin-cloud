@@ -31,7 +31,7 @@ import { restore, summarizeReport } from "./lib/restorer.js";
 import { checkUpdates, fetchPackument } from "./lib/versions.js";
 import { planSubscription, BLOCKER_TEXT } from "./lib/subscriptions.js";
 import { replaceDependency } from "./lib/manifest.js";
-import { createJobRegistry, stepsFor } from "./lib/jobs.js";
+import { createJobRegistry, stepsFor, subscribeStepsFor } from "./lib/jobs.js";
 
 export const name = "plugin-cloud";
 export const inject = ["webServer"];
@@ -327,6 +327,112 @@ export function apply(ctx, rawConfig) {
 		// Upgrading changes the installed set: take a snapshot of the result so
 		// the change is captured even if the change event lands later.
 		void scheduler.force("upgrade").catch(() => {});
+		jobs.finish(jobId, {
+			results,
+			restartRequired,
+			ok: results.every((r) => r.ok),
+		});
+	}
+
+	/**
+	 * Run one subscribe job to completion, reporting each step as it starts.
+	 *
+	 * The step boundaries are the real boundaries of the work: inspect the
+	 * checkout, derive the pinned spec, install. Reporting them is what makes
+	 * the panel honest — when it says "执行 pnpm 安装", pnpm is running, and a
+	 * subscribe that stalls shows exactly which step stalled instead of a
+	 * spinner that means nothing.
+	 *
+	 * A blocked checkout is reported as a blocker list rather than a generic
+	 * error, so the UI can say "有未提交的改动" instead of "订阅失败".
+	 *
+	 * @param {object} options
+	 * @param {string} options.jobId - job to advance.
+	 * @param {string[]} options.names - plugins being subscribed.
+	 * @param {object} options.manager - pluginManager.
+	 * @param {string} options.dir - profile directory.
+	 */
+	async function runSubscribeJob({ jobId, names, manager, dir }) {
+		const results = [];
+		let restartRequired = false;
+
+		if (jobs.isCancelled(jobId)) {
+			jobs.finish(jobId, { results, restartRequired: false, ok: false, cancelled: true });
+			return;
+		}
+
+		// The inventory is read once: the loop only needs each plugin's kind and
+		// path, and re-collecting per plugin would re-read the whole profile.
+		let byName = new Map();
+		try {
+			const snap = await snapshot("inventory", "插件清单");
+			byName = new Map(snap.plugins.map((p) => [p.name, p]));
+		} catch {
+			// A failed inventory is not fatal: the per-plugin lookup below reports
+			// `unknown-plugin`, which is the same conclusion with a usable code.
+		}
+
+		for (const [index, name] of names.entries()) {
+			const row = { name, ok: false, error: null, errorCode: null, spec: null };
+			const advance = (stepIndex, phase) => jobs.advance(jobId, { index, stepIndex, phase });
+
+			if (jobs.isCancelled(jobId)) {
+				row.errorCode = "cancelled";
+				row.error = "cancelled";
+				results.push(row);
+				jobs.pushResult(jobId, row);
+				break;
+			}
+
+			try {
+				advance(0, "inspecting");
+				if (name === "dsh-plugin-cloud") throw new Error("self-subscribe-blocked");
+				const plugin = byName.get(name);
+				if (plugin === undefined) throw new Error("unknown-plugin");
+				if (plugin.kind !== "path") throw new Error("not-a-local-plugin");
+
+				advance(1, "planning");
+				const plan = await planSubscription({ name, path: plugin.path ?? plugin.git?.path ?? null });
+				row.spec = plan.spec;
+				if (!plan.ready) {
+					const blocker = new Error(`subscribe-blocked:${plan.blockedBy.join(",")}`);
+					blocker.codes = plan.blockedBy;
+					throw blocker;
+				}
+
+				// A git spec is exact by construction: it names a commit, so
+				// saveExact adds nothing but costs a lock.
+				advance(3, "installing");
+				const outcome = await replaceDependency({
+					manager,
+					dir,
+					name,
+					spec: plan.spec,
+					installOptions: { saveExact: true },
+				});
+
+				advance(4, "verifying");
+				row.ok = outcome.ok === true;
+				row.via = outcome.via ?? null;
+				row.application = outcome.application ?? null;
+				if (!row.ok) {
+					row.errorCode = outcome.errorCode ?? "operation-error";
+					row.error = outcome.error ?? row.errorCode;
+					row.restored = outcome.restored ?? null;
+				} else if (row.application !== "applied") {
+					restartRequired = true;
+				}
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				row.errorCode = message;
+				row.error = message;
+				if (Array.isArray(error?.codes)) row.blockedBy = error.codes;
+			}
+			results.push(row);
+			jobs.pushResult(jobId, row);
+		}
+
+		void scheduler.force("subscribe").catch(() => {});
 		jobs.finish(jobId, {
 			results,
 			restartRequired,
@@ -706,69 +812,39 @@ export function apply(ctx, rawConfig) {
 						return;
 					}
 
-					// ---- subscribe a local checkout to its git remote ----------------
+					// ---- subscribe a local checkout to its git remote (as a job) ------
 					// Same manifest seam as an upgrade: the dependency is already in
 					// package.json, so the manager's `already-installed` guard fires
 					// and the refusal arrives folded into the result, not as a throw.
+					//
+					// It runs as a job for the same reason upgrades do: inspecting a
+					// checkout runs several git commands and the install runs pnpm, so a
+					// synchronous response leaves the panel spinning with nothing to
+					// show. Subscribing was the last synchronous action here, and the
+					// first thing a user asked about it was "it just spins".
 					if (req.method === "POST" && route === "/subscribe") {
 						const manager = ctx.get("pluginManager", false);
 						if (manager === null || manager === undefined) {
-							writeJson(res, 503, { error: "插件管理器不可用" });
+							writeJson(res, 503, { error: "manager-unavailable" });
+							return;
+						}
+						const running = jobs.running();
+						if (running !== null) {
+							writeJson(res, 409, { error: "job-running", job: running });
 							return;
 						}
 						const body = JSON.parse((await readBody(req)) || "{}");
 						const names = Array.isArray(body.names) ? body.names : body.name ? [body.name] : [];
-						if (names.length === 0) { writeJson(res, 400, { error: "没有指定要订阅的插件" }); return; }
-						const snap = await snapshot("inventory", "插件清单");
-						const byName = new Map(snap.plugins.map((p) => [p.name, p]));
-						const results = [];
-						for (const raw of names) {
-							const name = String(raw);
-							const row = { name, ok: false, error: null, errorCode: null, spec: null };
-							try {
-								if (name === "dsh-plugin-cloud") throw new Error("self-subscribe-blocked");
-								const plugin = byName.get(name);
-								if (plugin === undefined) throw new Error("unknown-plugin");
-								if (plugin.kind !== "path") throw new Error("not-a-local-plugin");
-								const plan = await planSubscription({ name, path: plugin.path ?? plugin.git?.path ?? null });
-								row.spec = plan.spec;
-								if (!plan.ready) {
-									const blocker = new Error(`subscribe-blocked:${plan.blockedBy.join(",")}`);
-									blocker.codes = plan.blockedBy;
-									throw blocker;
-								}
-								// A git spec is exact by construction: it names a commit,
-								// so saveExact adds nothing but costs a lock.
-								const outcome = await replaceDependency({
-									manager,
-									dir,
-									name,
-									spec: plan.spec,
-									installOptions: { saveExact: true },
-								});
-								row.ok = outcome.ok === true;
-								row.via = outcome.via ?? null;
-								row.application = outcome.application ?? null;
-								if (!row.ok) {
-									row.errorCode = outcome.errorCode ?? "operation-error";
-									row.error = outcome.error ?? row.errorCode;
-									row.restored = outcome.restored ?? null;
-								}
-							} catch (error) {
-								const message = error instanceof Error ? error.message : String(error);
-								row.errorCode = message;
-								row.error = message;
-								if (Array.isArray(error?.codes)) row.blockedBy = error.codes;
-							}
-							results.push(row);
-						}
-						void scheduler.force("subscribe").catch(() => {});
-						const applied = (r) => r.ok === true && r.application === "applied";
-						writeJson(res, 200, {
-							ok: results.every((r) => r.ok),
-							results,
-							restartRequired: results.some((r) => r.ok === true && !applied(r)),
+						if (names.length === 0) { writeJson(res, 400, { error: "no-subscribe-targets" }); return; }
+						const targets = names.map(String);
+						const stepSets = targets.map((n) => subscribeStepsFor(n));
+						const job = jobs.create({ names: targets, stepSets });
+						res.once("finish", () => {
+							void runSubscribeJob({ jobId: job.id, names: targets, manager, dir }).catch((error) => {
+								jobs.fail(job.id, error instanceof Error ? error.message : String(error));
+							});
 						});
+						writeJson(res, 202, { ok: true, job });
 						return;
 					}
 
