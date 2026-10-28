@@ -28,7 +28,7 @@ import * as gh from "./lib/github.js";
 import * as store from "./lib/store.js";
 import { createScheduler, fingerprint } from "./lib/autobackup.js";
 import { restore, summarizeReport } from "./lib/restorer.js";
-import { checkUpdates, fetchPackument } from "./lib/versions.js";
+import { checkUpdates, fetchPackument, githubSlug, remoteCommit } from "./lib/versions.js";
 import { planSubscription, BLOCKER_TEXT } from "./lib/subscriptions.js";
 import { replaceDependency } from "./lib/manifest.js";
 import { createJobRegistry, stepsFor, subscribeStepsFor, restoreStepsFor } from "./lib/jobs.js";
@@ -270,20 +270,50 @@ export function apply(ctx, rawConfig) {
 
 			try {
 				advance(0, "resolving");
-				// Self-upgrade would replace the code running this request.
+				// Self-upgrade would replace the code running this request. On
+				// Windows that cannot work at all: the running host holds the
+				// package directory open, so pnpm cannot rename over it.
 				if (name === "dsh-plugin-cloud") throw new Error("self-upgrade-blocked");
-				const packument = await fetchPackument(name, cfg.registry);
-				row.to = packument?.latest ?? null;
-				row.spec = row.to === null ? null : `${name}@${row.to}`;
-				// Rebuild this plugin's step labels now that the version is known:
-				// "解析 x 的目标版本（0.3.39）" beats a generic label.
+
+				// A plugin has one of two upgradable sources, and they resolve the
+				// target differently:
+				//
+				//   registry → the published version from the packument
+				//   git      → the remote branch tip (the current commit stays)
+				//
+				// Only the registry path was implemented, so a git row that the UI
+				// correctly marked "可更新" would have asked npm for a package that is
+				// not published there. Resolve per kind instead.
+				const current = (await (manager.listBundles?.() ?? [])).find((b) => b.name === name) ?? null;
+				const currentSpec = String(current?.spec ?? "");
+				const isGit = /^(git|git\+|github:)/.test(currentSpec) || /\.git(#|$)/.test(currentSpec);
+
+				let targetSpec = null;
+				if (isGit) {
+					const slug = githubSlug(currentSpec);
+					if (slug === null) throw new Error("unsupported-spec");
+					const tip = await remoteCommit(slug, "main");
+					if (tip === null) throw new Error("remote-unreachable");
+					row.to = tip;
+					row.spec = `github:${slug}#${tip}`;
+					targetSpec = row.spec;
+				} else {
+					const packument = await fetchPackument(name, cfg.registry);
+					row.to = packument?.latest ?? null;
+					row.spec = row.to === null ? null : `${name}@${row.to}`;
+					targetSpec = row.spec;
+				}
 				jobs.advance(jobId, { index, stepIndex: 0, phase: "resolving" });
-				if (row.to === null) throw new Error("registry-unreachable");
+				if (targetSpec === null) throw new Error(isGit ? "remote-unreachable" : "registry-unreachable");
 
 				advance(1, "preparing");
-				const installed = await (manager.listBundles?.() ?? []);
-				row.from = installed.find((b) => b.name === name)?.version ?? null;
-				if (row.from === row.to) {
+				row.from = current?.version ?? null;
+				// For git, "already current" means the pinned commit equals the tip;
+				// comparing versions would miss a commit-only change.
+				const sameGit = isGit
+					? String(currentSpec).includes(String(row.to)) || String(currentSpec).endsWith(String(row.to))
+					: false;
+				if (isGit ? sameGit : row.from === row.to) {
 					row.ok = true;
 					row.unchanged = true;
 					// Nothing was installed, so nothing needs a restart.
@@ -292,17 +322,25 @@ export function apply(ctx, rawConfig) {
 					jobs.pushResult(jobId, row);
 					continue;
 				}
+				if (isGit) row.application = null;
 
 				// saveExact writes `1.2.0`, not `^1.2.0`: a snapshot made after this
 				// must resolve to this same version elsewhere.
+				advance(2, "detaching");
+				// Same Windows obstacle as subscribe: a `link:`/git entry leaves a real
+				// directory or junction at `node_modules/<name>`, and pnpm imports with
+				// `rename(tmp, target)` — which Windows refuses when the target exists.
+				// Clearing it first is what lets the replacement land.
+				const unlinked = await unlinkNodeModulesEntry(dir, name);
 				advance(3, "installing");
 				const outcome = await replaceDependency({
 					manager,
 					dir,
 					name,
-					spec: `${name}@${row.to}`,
+					spec: targetSpec,
 					installOptions: { saveExact: true },
 				});
+				if (unlinked.kind === "removed") row.unlinked = unlinked.target ?? true;
 
 				advance(4, "verifying");
 				row.ok = outcome.ok === true;

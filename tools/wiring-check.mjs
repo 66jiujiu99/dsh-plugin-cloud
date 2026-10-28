@@ -115,4 +115,41 @@ const jobsRaw = await readFile(join(ROOT, 'lib', 'jobs.js'), 'utf8');
 	check('禁止自我订阅', hostRaw.includes('self-subscribe-blocked'));
 }
 
+// ── 8. 升级必须支持 git 来源 ────────────────────────────────
+// 前端把 git 行标成「可更新」却没有按钮，后端 /upgrade 又只会问 npm ——
+// 两条都断了，于是「可更新」是个死标签。
+{
+	// 前端：按钮不能只给 registry
+	const canUpgradeLine = clientRaw.split('\n').find((l) => l.includes('const canUpgrade ='));
+	check('找到 canUpgrade 判定', canUpgradeLine !== undefined);
+	// 判定可以写成内联条件，也可以抽成 upgradableKind 变量，所以检查的是
+	// 「git 被纳入了可升级集合」，而不是某种具体写法。
+	const upgradeGate = (clientRaw.match(/const upgradableKind = [^;]+;/) ?? [''])[0]
+		+ (canUpgradeLine ?? '');
+	check('★ 升级按钮不再只限 registry',
+		/kind === 'git'/.test(upgradeGate) && !/canUpgrade = isUpdatable && p\.kind === 'registry'/.test(canUpgradeLine ?? ''),
+		String(upgradeGate).trim());
+	check('自身不可升级时给出说明',
+		clientRaw.includes('selfUpgradeNote'), '缺少 selfUpgradeNote');
+
+	// 后端：按来源分流解析目标
+	check('升级按 kind 分流', hostRaw.includes('isGit'), '没有 isGit 判定');
+	check('git 升级读远端 commit', hostRaw.includes('remoteCommit('), '没有 remoteCommit 调用');
+	check('git 升级用 github: 前缀的 spec',
+		/row\.spec = `github:\$\{slug\}#\$\{tip\}`/.test(hostRaw), '没有构造 git spec');
+	check('安装用解析出来的 targetSpec',
+		hostRaw.includes('spec: targetSpec'), '没有用 targetSpec');
+	// git 升级同样要清 node_modules，否则 rename 会 EPERM
+	const upgradeStart = hostRaw.indexOf('async function runUpgradeJob(');
+	const upgradeBody = hostRaw.slice(upgradeStart, hostRaw.indexOf('async function runSubscribeJob('));
+	check('★ 升级也移除 node_modules 链接',
+		upgradeBody.includes('unlinkNodeModulesEntry'), '升级流程没清链接');
+}
+
+// ── 9. 升级同类问题：git 与 registry 的「已是最新」判定不同 ──
+{
+	check('git 用 commit 相等判断而不是版本号',
+		hostRaw.includes('sameGit'), '没有 sameGit 判定');
+}
+
 console.log(`\n${passed} checks passed`);

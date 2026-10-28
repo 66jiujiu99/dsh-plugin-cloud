@@ -47,9 +47,13 @@ window.__ModuleLoader__.load({
 			cancel: '取消',
 			cancelling: '正在取消…',
 			jobLost: '与升级任务的连接中断了，请刷新查看结果',
+			selfUpgradeNote: '需手动升级',
+			selfUpgradeHint: '本插件不能升级自己：替换正在处理请求的代码在 Windows 上必然失败。请在源目录 git pull 后重启 DSH。',
 			errJobRunning: '已有升级任务在运行，请等它结束',
 			errJobNotFound: '找不到这个升级任务',
 			errNoRunningJob: '当前没有正在运行的升级任务',
+			errUnsupportedSpec: '快照里的安装地址无法识别，不能升级',
+			errRemoteUnreachable: '读不到远端仓库，暂时无法判断有没有更新',
 			upgrade: '升级',
 			upgradeAll: '全部升级',
 			checkUpdates: '检查更新',
@@ -192,9 +196,13 @@ window.__ModuleLoader__.load({
 			cancel: 'Cancel',
 			cancelling: 'Cancelling…',
 			jobLost: 'Lost contact with the upgrade; refresh to see the result',
+			selfUpgradeNote: 'manual upgrade',
+			selfUpgradeHint: 'This plugin cannot upgrade itself: replacing the code handling this request fails on Windows. Run git pull in the source directory, then restart DSH.',
 			errJobRunning: 'An upgrade is already running; wait for it to finish',
 			errJobNotFound: 'That upgrade job was not found',
 			errNoRunningJob: 'No upgrade job is running',
+			errUnsupportedSpec: 'The recorded install spec cannot be understood',
+			errRemoteUnreachable: 'The remote could not be read, so updates cannot be checked',
 			upgrade: 'Upgrade',
 			upgradeAll: 'Upgrade all',
 			checkUpdates: 'Check',
@@ -391,6 +399,8 @@ window.__ModuleLoader__.load({
 			'job-running': 'errJobRunning',
 			'job-not-found': 'errJobNotFound',
 			'no-running-job': 'errNoRunningJob',
+			'unsupported-spec': 'errUnsupportedSpec',
+			'remote-unreachable': 'errRemoteUnreachable',
 		};
 
 		/** Subscription blocker code → dictionary key. */
@@ -971,7 +981,16 @@ window.__ModuleLoader__.load({
 			else if (rows.length === 0) body = h('div', { className: 'pc-empty' }, t('noPlugins'));
 			else body = h('div', {}, head, ...rows.map((p) => {
 				const isUpdatable = p.update?.updateAvailable === true;
-				const canUpgrade = isUpdatable && p.kind === 'registry' && p.name !== data.selfName;
+				// Registry packages and git dependencies are both upgradable — a
+				// subscribed plugin whose upstream moved on is exactly the case this
+				// tab exists for. Restricting the button to `registry` left a git row
+				// showing "可更新" with nothing to click.
+				const upgradableKind = p.kind === 'registry' || p.kind === 'git';
+				const canUpgrade = isUpdatable && upgradableKind && p.name !== data.selfName;
+				// Self-upgrade is refused server-side: replacing the code that is
+				// handling this request cannot work on Windows. Say so instead of
+				// leaving a dead "可更新" badge with no explanation.
+				const selfUpdatable = isUpdatable && p.name === data.selfName && p.kind !== 'path';
 				const canSubscribe = p.kind === 'path'
 					&& (data.subscriptions ?? []).some((s) => s.name === p.name && s.ready);
 				// Newer Hosts split the locale-mapped title into titleZh / titleEn;
@@ -1016,6 +1035,11 @@ window.__ModuleLoader__.load({
 								disabled: busy !== null,
 								onClick: () => doUpgrade([p.name]),
 							}, busy === 'upgrade' ? h(Spinner) : t('upgrade'))
+							: null,
+						// A dead "可更新" badge with no button and no reason is worse than
+						// no badge: the user cannot tell whether the tab is broken.
+						selfUpdatable
+							? h('span', { className: 'pc-muted', title: t('selfUpgradeHint') }, t('selfUpgradeNote'))
 							: null,
 						canSubscribe
 							? h('button', {
