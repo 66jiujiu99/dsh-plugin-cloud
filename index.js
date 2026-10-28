@@ -31,7 +31,7 @@ import { restore, summarizeReport } from "./lib/restorer.js";
 import { checkUpdates, fetchPackument } from "./lib/versions.js";
 import { planSubscription, BLOCKER_TEXT } from "./lib/subscriptions.js";
 import { replaceDependency } from "./lib/manifest.js";
-import { createJobRegistry, stepsFor, subscribeStepsFor } from "./lib/jobs.js";
+import { createJobRegistry, stepsFor, subscribeStepsFor, restoreStepsFor } from "./lib/jobs.js";
 import { installDetached } from "./lib/detach.js";
 
 export const name = "plugin-cloud";
@@ -461,6 +461,48 @@ export function apply(ctx, rawConfig) {
 		});
 	}
 
+	/**
+	 * Run one snapshot restore to completion, reporting each step.
+	 *
+	 * The step indices come from `restore()`'s own `onStep` callback, so the UI
+	 * shows the plugin and step that are actually running rather than a guess
+	 * derived from timers. A restore that fails on plugin 3 of 7 reports exactly
+	 * that, with the rows for 1-2 already visible.
+	 *
+	 * @param {object} options
+	 * @param {string} options.jobId - job to advance.
+	 * @param {object} options.snapshot - snapshot document.
+	 */
+	async function runRestoreJob({ jobId, snapshot }) {
+		const stepOrder = ["resolve", "prepare", "install", "verify"];
+		let restartRequired = false;
+		let rows = [];
+		try {
+			rows = await restore({
+				manager: manager(),
+				snapshot,
+				dryRun: false,
+				profileDir: dir,
+				profile,
+				onStep: ({ index, stepId, phase }) => {
+					const stepIndex = stepOrder.indexOf(stepId);
+					jobs.advance(jobId, { index, stepIndex: stepIndex < 0 ? 0 : stepIndex, phase });
+				},
+			});
+			restartRequired = rows.some((r) => r.status === "installed-restart");
+		} catch (error) {
+			jobs.fail(jobId, error instanceof Error ? error.message : String(error));
+			return;
+		}
+		void scheduler.force("restore").catch(() => {});
+		jobs.finish(jobId, {
+			results: rows,
+			summary: summarizeReport(rows),
+			restartRequired,
+			ok: rows.every((r) => r.status !== "failed"),
+		});
+	}
+
 	ctx.inject(["webServer"], (scope) => {
 		scope.effect(() => scope.webServer.register({
 			kind: "prefix",
@@ -561,9 +603,34 @@ export function apply(ctx, rawConfig) {
 						return;
 					}
 
-					// ---- restore -------------------------------------------------
+					// ---- restore (as a job) --------------------------------------
+					// Restoring installs every plugin in the snapshot, one pnpm run
+					// each, so a synchronous response left the panel spinning for
+					// minutes. A cross-machine restore that installed 1 of 7 looked
+					// exactly like one still working. It runs as a job like upgrade and
+					// subscribe, reporting which plugin and which step is running.
 					if (req.method === "POST" && route === "/restore") {
+						const running = jobs.running();
+						if (running !== null) {
+							writeJson(res, 409, { error: "job-running", job: running });
+							return;
+						}
 						const body = JSON.parse((await readBody(req)) || "{}");
+						const dryRun = body.confirm !== true;
+						if (dryRun) {
+							// A dry run installs nothing, so it stays synchronous: no job,
+							// no polling, and the answer arrives complete.
+							const safe = String(body.file ?? "").replace(/[\\/]/g, "").replace(/\.\./g, "");
+							let snap = body.snapshot ?? (safe ? await store.loadLocal(safe) : null);
+							if (!snap && safe && cloudReady(cfg)) {
+								const remote = await gh.readFile(await token(cfg.tokenRef), cfg.repo, `snapshots/${safe}`);
+								if (remote) snap = JSON.parse(remote.content);
+							}
+							if (!snap) { writeJson(res, 404, { error: "not-found" }); return; }
+							const rows = await restore({ manager: manager(), snapshot: snap, dryRun: true, profileDir: dir, profile });
+							writeJson(res, 200, { dryRun: true, report: rows, summary: summarizeReport(rows) });
+							return;
+						}
 						const safe = String(body.file ?? "").replace(/[\\/]/g, "").replace(/\.\./g, "");
 						let snap = body.snapshot ?? (safe ? await store.loadLocal(safe) : null);
 						if (!snap && safe && cloudReady(cfg)) {
@@ -571,9 +638,16 @@ export function apply(ctx, rawConfig) {
 							if (remote) snap = JSON.parse(remote.content);
 						}
 						if (!snap) { writeJson(res, 404, { error: "not-found" }); return; }
-						const dryRun = body.confirm !== true;
-						const rows = await restore({ manager: manager(), snapshot: snap, dryRun, profileDir: dir, profile });
-						writeJson(res, 200, { dryRun, report: rows, summary: summarizeReport(rows) });
+						const names = (snap.plugins ?? []).map((p) => String(p.name));
+						const stepSets = (snap.plugins ?? []).map((p) => restoreStepsFor(String(p.name), p.kind));
+						const job = jobs.create({ names, stepSets });
+						// Start after the response so the id reaches the UI first.
+						res.once("finish", () => {
+							void runRestoreJob({ jobId: job.id, snapshot: snap }).catch((error) => {
+								jobs.fail(job.id, error instanceof Error ? error.message : String(error));
+							});
+						});
+						writeJson(res, 202, { ok: true, dryRun: false, job });
 						return;
 					}
 
