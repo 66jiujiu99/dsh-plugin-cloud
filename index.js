@@ -292,7 +292,10 @@ export function apply(ctx, rawConfig) {
 				if (isGit) {
 					const slug = githubSlug(currentSpec);
 					if (slug === null) throw new Error("unsupported-spec");
-					const tip = await remoteCommit(slug, "main");
+					// `DSH_PLUGIN_CLOUD_GIT_URL` is a test seam: point the remote lookup at a
+					// local repository. Production never sets it.
+					const gitUrlOverride = process.env.DSH_PLUGIN_CLOUD_GIT_URL ?? undefined;
+					const tip = await remoteCommit(slug, "main", gitUrlOverride ? { url: gitUrlOverride } : {});
 					if (tip === null) throw new Error("remote-unreachable");
 					row.to = tip;
 					row.spec = `github:${slug}#${tip}`;

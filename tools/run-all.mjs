@@ -20,6 +20,8 @@ const SUITES = [
 	{ name: '快照装回', file: 'tools/restore-check.mjs' },
 	{ name: '接线完整性', file: 'tools/wiring-check.mjs' },
 	{ name: '订阅端到端', file: 'tools/e2e-subscribe.mjs' },
+	{ name: '升级端到端', file: 'tools/e2e-upgrade-job.mjs' },
+	{ name: '装回端到端', file: 'tools/e2e-restore-job.mjs' },
 	{ name: '元数据渲染回归', file: 'tools/metadata-check.mjs' },
 ];
 
