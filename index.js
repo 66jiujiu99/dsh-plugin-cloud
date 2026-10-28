@@ -32,7 +32,7 @@ import { checkUpdates, fetchPackument } from "./lib/versions.js";
 import { planSubscription, BLOCKER_TEXT } from "./lib/subscriptions.js";
 import { replaceDependency } from "./lib/manifest.js";
 import { createJobRegistry, stepsFor, subscribeStepsFor, restoreStepsFor } from "./lib/jobs.js";
-import { installDetached } from "./lib/detach.js";
+import { installDetached, unlinkNodeModulesEntry } from "./lib/detach.js";
 
 export const name = "plugin-cloud";
 export const inject = ["webServer"];
@@ -401,17 +401,26 @@ export function apply(ctx, rawConfig) {
 					throw blocker;
 				}
 
-				// A git spec is exact by construction: it names a commit, so
-				// saveExact adds nothing but costs a lock.
+				// The bundle is detached first, and its `node_modules` link removed.
 				//
-				// The bundle is detached first. On Windows `pnpm` cannot replace a
-				// package directory the running host still holds open, and a `link:`
-				// plugin is loaded precisely because it is selected. Without the
-				// detach the download succeeds and the final rename fails with EPERM
-				// — which surfaces as a minute-long spinner and looks like a network
-				// problem. `installDetached` restores the selection in a `finally`,
-				// so a failed install never leaves the plugin dropped from the profile.
+				// Two separate obstacles, and both must go:
+				//
+				//   1. The bundle is *selected*, so the host keeps loading it. Removing
+				//      it from `dsh.profile.bundles` is what `setBundleEnabled(false)`
+				//      does, and `removeBundle` cannot be used — without HMR it refuses
+				//      to touch a bundle that was loaded at startup (`stop-profile`).
+				//
+				//   2. A `link:` dependency leaves a junction at `node_modules/<name>`.
+				//      pnpm imports a package with `rename(tmp, target)`, and Windows
+				//      refuses to overwrite an existing target — it raises `EPERM`, after
+				//      the download has already succeeded. Deselecting the bundle does
+				//      not remove that junction, so it has to be unlinked explicitly.
+				//
+				// Missing step 2 is what left a subscribe stuck at "临时停用" for minutes
+				// with an empty pnpm log: the install never started, because the target
+				// directory was still sitting there.
 				advance(2, "detaching");
+				const unlinked = await unlinkNodeModulesEntry(dir, name);
 				const guarded = await installDetached({
 					dir,
 					name,
@@ -426,6 +435,7 @@ export function apply(ctx, rawConfig) {
 						installOptions: { saveExact: true },
 					}),
 				});
+				if (unlinked.kind === "removed") row.unlinked = unlinked.target ?? true;
 
 				advance(5, "verifying");
 				const outcome = guarded.outcome ?? {};
