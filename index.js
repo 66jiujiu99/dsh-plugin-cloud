@@ -32,6 +32,7 @@ import { checkUpdates, fetchPackument } from "./lib/versions.js";
 import { planSubscription, BLOCKER_TEXT } from "./lib/subscriptions.js";
 import { replaceDependency } from "./lib/manifest.js";
 import { createJobRegistry, stepsFor, subscribeStepsFor } from "./lib/jobs.js";
+import { installDetached } from "./lib/detach.js";
 
 export const name = "plugin-cloud";
 export const inject = ["webServer"];
@@ -402,23 +403,43 @@ export function apply(ctx, rawConfig) {
 
 				// A git spec is exact by construction: it names a commit, so
 				// saveExact adds nothing but costs a lock.
-				advance(3, "installing");
-				const outcome = await replaceDependency({
-					manager,
+				//
+				// The bundle is detached first. On Windows `pnpm` cannot replace a
+				// package directory the running host still holds open, and a `link:`
+				// plugin is loaded precisely because it is selected. Without the
+				// detach the download succeeds and the final rename fails with EPERM
+				// — which surfaces as a minute-long spinner and looks like a network
+				// problem. `installDetached` restores the selection in a `finally`,
+				// so a failed install never leaves the plugin dropped from the profile.
+				advance(2, "detaching");
+				const guarded = await installDetached({
 					dir,
 					name,
-					spec: plan.spec,
-					installOptions: { saveExact: true },
+					onPhase: (phase) => {
+						advance(phase === "install" ? 3 : 4, phase === "install" ? "installing" : "reattaching");
+					},
+					install: () => replaceDependency({
+						manager,
+						dir,
+						name,
+						spec: plan.spec,
+						installOptions: { saveExact: true },
+					}),
 				});
 
-				advance(4, "verifying");
-				row.ok = outcome.ok === true;
+				advance(5, "verifying");
+				const outcome = guarded.outcome ?? {};
+				row.ok = guarded.ok === true;
 				row.via = outcome.via ?? null;
 				row.application = outcome.application ?? null;
+				row.detached = guarded.detached === true;
 				if (!row.ok) {
-					row.errorCode = outcome.errorCode ?? "operation-error";
-					row.error = outcome.error ?? row.errorCode;
+					row.errorCode = guarded.error ?? outcome.errorCode ?? "operation-error";
+					row.error = guarded.error ?? outcome.error ?? row.errorCode;
 					row.restored = outcome.restored ?? null;
+					// A failed re-attach means the plugin is no longer selected: say so
+					// loudly, because that is a worse state than a failed subscribe.
+					if (guarded.reattached === false) row.reattachFailed = true;
 				} else if (row.application !== "applied") {
 					restartRequired = true;
 				}

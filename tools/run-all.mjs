@@ -16,6 +16,7 @@ const SUITES = [
 	{ name: '表格对齐', file: 'tools/table-check.mjs' },
 	{ name: 'manifest 改写与回滚', file: 'tools/manifest-check.mjs' },
 	{ name: '升级任务的进度与取消', file: 'tools/jobs-check.mjs' },
+	{ name: '停用后安装再启用', file: 'tools/detach-check.mjs' },
 	{ name: '元数据渲染回归', file: 'tools/metadata-check.mjs' },
 ];
 
