@@ -42,6 +42,15 @@ export const inject = ["webServer"];
 
 const PREFIX = "/api/plugin-cloud";
 
+/**
+ * This plugin's own package name.
+ *
+ * Named once so the status rule, the self-upgrade/subscribe guards and the
+ * `selfName` field cannot drift apart — a mismatch here shows the user a
+ * "可更新" badge for a plugin that is refused by name two branches away.
+ */
+const SELF_NAME = "dsh-plugin-cloud";
+
 /** The profile this Host is running. */
 function profileInfo() {
 	const home = process.env.DSH_HOME ?? join(homedir(), ".dsh");
@@ -63,7 +72,15 @@ const writeJson = (res, status, body) => {
 function pluginStatus(plugin, update) {
 	if (plugin.installed === false) return "missing";
 	if (plugin.enabled === false) return "disabled";
-	if (update?.updateAvailable === true) return plugin.kind === "path" ? "behind-upstream" : "updatable";
+	if (update?.updateAvailable === true) {
+		// This plugin cannot upgrade itself: the upgrade would replace the code
+		// handling the request, which Windows refuses (`rename` over a directory
+		// the running host holds open). Reporting `updatable` for it produced a
+		// dead "可更新" badge with no button — every user reads that as a bug.
+		// Give it its own state so the badge itself says what to do.
+		if (plugin.name === SELF_NAME) return "self-update";
+		return plugin.kind === "path" ? "behind-upstream" : "updatable";
+	}
 	if (plugin.kind === "path" && update?.tracked === false) return "untracked";
 	// A subscribed plugin whose remote could not be read is *unknown*, not
 	// unsupported: the spec is fine, the network or the token is not. Saying
@@ -273,7 +290,7 @@ export function apply(ctx, rawConfig) {
 				// Self-upgrade would replace the code running this request. On
 				// Windows that cannot work at all: the running host holds the
 				// package directory open, so pnpm cannot rename over it.
-				if (name === "dsh-plugin-cloud") throw new Error("self-upgrade-blocked");
+				if (name === SELF_NAME) throw new Error("self-upgrade-blocked");
 
 				// A plugin has one of two upgradable sources, and they resolve the
 				// target differently:
@@ -428,7 +445,7 @@ export function apply(ctx, rawConfig) {
 
 			try {
 				advance(0, "inspecting");
-				if (name === "dsh-plugin-cloud") throw new Error("self-subscribe-blocked");
+				if (name === SELF_NAME) throw new Error("self-subscribe-blocked");
 				const plugin = byName.get(name);
 				if (plugin === undefined) throw new Error("unknown-plugin");
 				if (plugin.kind !== "path") throw new Error("not-a-local-plugin");
@@ -870,7 +887,7 @@ export function apply(ctx, rawConfig) {
 								subscribable: plans.filter((p) => p.ready).length,
 							},
 							// The user's own plugin (this one) is never offered for self-upgrade.
-							selfName: "dsh-plugin-cloud",
+							selfName: SELF_NAME,
 							updateError,
 							generatedAt: new Date().toISOString(),
 							cached,

@@ -41,6 +41,7 @@ window.__ModuleLoader__.load({
 			statusUntracked: '本地未跟踪',
 			statusUnsupported: '无法检查',
 			statusUnreachable: '远端读取失败',
+			statusSelfUpdate: '需手动升级',
 			statusBehindUpstream: '上游有新提交',
 			noVersionUpstream: '按提交跟踪',
 			jobProgress: '正在处理 {done}/{total}',
@@ -48,6 +49,7 @@ window.__ModuleLoader__.load({
 			cancelling: '正在取消…',
 			jobLost: '与升级任务的连接中断了，请刷新查看结果',
 			selfUpgradeNote: '需手动升级',
+			selfUpgradeCopied: '已复制命令',
 			selfUpgradeHint: '本插件不能升级自己：替换正在处理请求的代码在 Windows 上必然失败。请在源目录 git pull 后重启 DSH。',
 			errJobRunning: '已有升级任务在运行，请等它结束',
 			errJobNotFound: '找不到这个升级任务',
@@ -190,6 +192,7 @@ window.__ModuleLoader__.load({
 			statusUntracked: 'Local, untracked',
 			statusUnsupported: 'Uncheckable',
 			statusUnreachable: 'Remote unreachable',
+			statusSelfUpdate: 'Manual upgrade',
 			statusBehindUpstream: 'Upstream ahead',
 			noVersionUpstream: 'tracked by commit',
 			jobProgress: 'Working on {done}/{total}',
@@ -197,6 +200,7 @@ window.__ModuleLoader__.load({
 			cancelling: 'Cancelling…',
 			jobLost: 'Lost contact with the upgrade; refresh to see the result',
 			selfUpgradeNote: 'manual upgrade',
+			selfUpgradeCopied: 'command copied',
 			selfUpgradeHint: 'This plugin cannot upgrade itself: replacing the code handling this request fails on Windows. Run git pull in the source directory, then restart DSH.',
 			errJobRunning: 'An upgrade is already running; wait for it to finish',
 			errJobNotFound: 'That upgrade job was not found',
@@ -570,6 +574,7 @@ window.__ModuleLoader__.load({
 .pc-badge.untracked { color:#c9a84c; background:rgba(201,168,76,.15); border-color:rgba(201,168,76,.32); }
 .pc-badge.unsupported { color:#9aa4b2; background:rgba(128,128,128,.12); border-color:rgba(128,128,128,.22); }
 .pc-badge.unreachable { color:#c9a84c; background:rgba(201,168,76,.14); border-color:rgba(201,168,76,.30); }
+.pc-badge.self-update { color:#c9a84c; background:rgba(201,168,76,.14); border-color:rgba(201,168,76,.30); }
 /* Live upgrade progress: the real pipeline steps, not an indeterminate bar. */
 .pc-job { border:1px solid var(--dsw-border,rgba(128,128,128,.26)); border-radius:12px;
   padding:10px 14px; background:rgba(77,163,255,.05); display:flex; flex-direction:column; gap:6px; }
@@ -667,6 +672,23 @@ window.__ModuleLoader__.load({
 			return '—';
 		}
 
+		/**
+		 * The exact command a user runs to upgrade this plugin by hand.
+		 *
+		 * Self-upgrade is refused server-side, so this string is the whole remedy.
+		 * Deriving it from the row (rather than hardcoding) keeps the pinned commit
+		 * and the remote URL in sync with what the Host actually recorded.
+		 *
+		 * @param {object} plugin - row from the Host.
+		 * @returns {string} a copy-pasteable command.
+		 */
+		function selfUpgradeCommand(plugin) {
+			const update = plugin.update ?? {};
+			const slug = update.slug ?? 'owner/repo';
+			const commit = update.latestCommit ?? update.pinned ?? '<commit>';
+			return `cd ~/.dsh/profiles/desktop && pnpm add "github:${slug}#${commit}" --save-exact`;
+		}
+
 		const STATUS_KEY = {
 			current: 'statusCurrent',
 			updatable: 'statusUpdatable',
@@ -675,6 +697,8 @@ window.__ModuleLoader__.load({
 			missing: 'statusMissing',
 			untracked: 'statusUntracked',
 			unsupported: 'statusUnsupported',
+			// 本插件自己落后时不能自我升级，用独立状态说明，而不是「可更新」+没按钮
+			'self-update': 'statusSelfUpdate',
 			// Distinguished from `unsupported`: the spec is fine and the plugin is
 			// subscribed, but the remote could not be read just now. Collapsing the
 			// two told users their setup was broken when the network was.
@@ -987,10 +1011,13 @@ window.__ModuleLoader__.load({
 				// showing "可更新" with nothing to click.
 				const upgradableKind = p.kind === 'registry' || p.kind === 'git';
 				const canUpgrade = isUpdatable && upgradableKind && p.name !== data.selfName;
-				// Self-upgrade is refused server-side: replacing the code that is
-				// handling this request cannot work on Windows. Say so instead of
-				// leaving a dead "可更新" badge with no explanation.
-				const selfUpdatable = isUpdatable && p.name === data.selfName && p.kind !== 'path';
+				// This plugin cannot upgrade itself: the install would replace the code
+				// handling the request, and Windows refuses to rename over a directory
+				// the running host holds open. The Host reports that as its own status
+				// (`self-update`) so the badge itself says what to do — a "可更新" badge
+				// with no button is indistinguishable from a broken tab.
+				const selfUpdatable = p.status === 'self-update'
+					|| (isUpdatable && p.name === data.selfName && p.kind !== 'path');
 				const canSubscribe = p.kind === 'path'
 					&& (data.subscriptions ?? []).some((s) => s.name === p.name && s.ready);
 				// Newer Hosts split the locale-mapped title into titleZh / titleEn;
@@ -1037,9 +1064,24 @@ window.__ModuleLoader__.load({
 							}, busy === 'upgrade' ? h(Spinner) : t('upgrade'))
 							: null,
 						// A dead "可更新" badge with no button and no reason is worse than
-						// no badge: the user cannot tell whether the tab is broken.
+						// A dead badge with no way forward is worse than no badge: the
+						// user cannot tell whether the tab is broken or the plugin is
+						// simply special. Show the exact command instead.
 						selfUpdatable
-							? h('span', { className: 'pc-muted', title: t('selfUpgradeHint') }, t('selfUpgradeNote'))
+							? h('span', {
+								className: 'pc-muted pc-self-update',
+								title: t('selfUpgradeHint'),
+								// Clicking copies the command, so "需手动升级" is actionable
+								// rather than a dead end.
+								onClick: (event) => {
+									const text = selfUpgradeCommand(p);
+									try {
+										void navigator.clipboard?.writeText?.(text);
+										event.currentTarget.textContent = t('selfUpgradeCopied');
+										setTimeout(() => { event.currentTarget.textContent = t('selfUpgradeNote'); }, 1500);
+									} catch { /* clipboard unavailable: the title still explains */ }
+								},
+							}, t('selfUpgradeNote'))
 							: null,
 						canSubscribe
 							? h('button', {

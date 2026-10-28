@@ -152,4 +152,36 @@ const jobsRaw = await readFile(join(ROOT, 'lib', 'jobs.js'), 'utf8');
 		hostRaw.includes('sameGit'), '没有 sameGit 判定');
 }
 
+// ── 10. 本插件落后时必须是 self-update，不能是可更新 ────────
+// 它永远不能自我升级（替换正在处理请求的代码在 Windows 上必然失败）。报
+// updatable 会让界面出现「可更新」却没有按钮，每个用户都会读成 bug。
+{
+	check('有 SELF_NAME 常量', hostRaw.includes('const SELF_NAME = '), '没有 SELF_NAME');
+	check('★ 本插件落后时状态是 self-update',
+		/plugin\.name === SELF_NAME\) return "self-update"/.test(hostRaw),
+		'没找到 self-update 分支');
+	// 三处引用必须都走常量，否则改名字时会漏掉一处
+	const selfNameUses = (hostRaw.match(/SELF_NAME/g) ?? []).length;
+	check('SELF_NAME 至少四处引用（定义/状态/两个守卫/selfName 字段）',
+		selfNameUses >= 5, String(selfNameUses));
+
+	// 前端
+	check('前端识别 self-update 状态',
+		clientRaw.includes("'self-update': 'statusSelfUpdate'"), 'STATUS_KEY 缺 self-update');
+	check('中英文都有状态文案',
+		clientRaw.includes("statusSelfUpdate: '需手动升级'") && clientRaw.includes("statusSelfUpdate: 'Manual upgrade'"),
+		'状态文案缺失');
+	check('★ 给出可执行的手动升级命令',
+		clientRaw.includes('function selfUpgradeCommand'), '没有 selfUpgradeCommand');
+	check('命令里带 pnpm add 与 save-exact',
+		/pnpm add "github:/.test(clientRaw) && clientRaw.includes('--save-exact'),
+		'命令不完整');
+}
+
+// ── 11. 状态徽标样式必须覆盖新状态 ─────────────────────────
+{
+	check('有 self-update 徽标样式',
+		clientRaw.includes('.pc-badge.self-update'), '缺 CSS');
+}
+
 console.log(`\n${passed} checks passed`);
