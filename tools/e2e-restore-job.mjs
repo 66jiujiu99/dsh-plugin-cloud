@@ -170,7 +170,9 @@ check('有恢复步骤', stepSets.length >= 3, String(stepSets.length));
 
 const final = start.json?.job?.id ? await waitJob(start.json.job.id) : null;
 check('任务结束', final !== null && final.status !== 'running', String(final?.status));
-check('任务成功', final?.ok === true, JSON.stringify(final?.summary));
+check('任务正常进入 done', final?.status === 'done', String(final?.status));
+check('含未解决项时任务 ok=false', final?.ok === false, JSON.stringify(final?.summary));
+check('任务失败语义不丢报告', Array.isArray(final?.results) && final.results.length === 5 && final?.summary?.unresolved === 1, JSON.stringify(final?.summary));
 
 const rows = final?.results ?? [];
 const byName = new Map(rows.map((r) => [r.name, r]));

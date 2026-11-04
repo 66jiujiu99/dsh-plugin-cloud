@@ -14,12 +14,12 @@
  *
  * Run: node tools/restore-check.mjs
  */
-import { mkdtemp, mkdir, writeFile, readFile, rm, lstat, symlink, readdir } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, rm, lstat, symlink, readdir, readlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import { restore, summarizeReport } from '../lib/restorer.js';
-import { unlinkNodeModulesEntry, linkedPathOf } from '../lib/detach.js';
+import { unlinkNodeModulesEntry, restoreNodeModulesEntry, linkedPathOf } from '../lib/detach.js';
 
 let passed = 0;
 const check = (label, ok, detail = '') => {
@@ -330,6 +330,204 @@ async function profileFixture() {
 	// 三种来源的 install 步骤文案必须不同，否则界面在骗人
 	const labels = ['registry', 'git', 'path'].map((k) => restoreStepsFor('x', k).find((s) => s.id === 'install').label);
 	check('三种来源的安装步骤文案不同', new Set(labels).size === 3, JSON.stringify(labels));
+}
+
+// ── 16. 安装失败必须恢复本次移除的链接（git + registry）─────
+for (const kind of ['git', 'registry']) {
+	const root = await mkdtemp(join(tmpdir(), `pc-restore-rollback-${kind}-`));
+	const profileDir = join(root, 'profile');
+	const sourceDir = join(root, 'source');
+	const name = `rollback-${kind}`;
+	const entry = join(profileDir, 'node_modules', name);
+	await mkdir(join(profileDir, 'node_modules'), { recursive: true });
+	await mkdir(sourceDir, { recursive: true });
+	await writeFile(join(sourceDir, 'marker.txt'), `original-${kind}`, 'utf8');
+	await symlink(sourceDir, entry, 'junction');
+	const beforeTarget = await readlink(entry);
+	const plugin = kind === 'git'
+		? { name, kind, spec: 'github:o/r#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' }
+		: { name, kind, version: '1.0.0' };
+	const manager = {
+		entryExistedDuringInstall: null,
+		async installBundle() {
+			this.entryExistedDuringInstall = await lstat(entry).then(() => true).catch(() => false);
+			return { application: 'failed', error: { code: 'operation-error', diagnostic: 'mock install failed' } };
+		},
+	};
+	const rows = await restore({ manager, snapshot: { plugins: [plugin] }, dryRun: false, profileDir, profile: 'desktop' });
+	const row = rows.find((r) => r.name === name);
+	const afterInfo = await lstat(entry).catch(() => null);
+	check(`${kind} 安装前确实移除旧链接`, manager.entryExistedDuringInstall === false, String(manager.entryExistedDuringInstall));
+	check(`${kind} 安装失败后链接已恢复`, afterInfo?.isSymbolicLink() === true, JSON.stringify(row));
+	check(`${kind} 恢复后的目标与之前一致`, afterInfo?.isSymbolicLink() === true && await readlink(entry) === beforeTarget);
+	check(`${kind} 失败报告明确说明链接已恢复`, String(row.detail).includes('已恢复'), String(row.detail));
+	check(`${kind} 恢复链接没有删源目录`, await readFile(join(sourceDir, 'marker.txt'), 'utf8') === `original-${kind}`);
+	await rm(root, { recursive: true, force: true });
+}
+
+// ── 17. readlink 失败时不得删除无法重建的链接 ────────────────
+// Windows 上很难稳定制造 lstat 成功而 readlink 失败的竞态，因此守住结构：
+// catch 必须直接返回 unavailable，不能落到 rmdir/unlink。
+{
+	const source = await readFile(new URL('../lib/detach.js', import.meta.url), 'utf8');
+	check('readlink 失败直接返回 unavailable，不继续删除',
+		/target = await readlink\(entry\);\s*\} catch \(error\) \{\s*\/\/[^\n]*\n\s*return \{ kind: "unavailable", reason:/.test(source));
+}
+
+// ── 18. already-installed 必须核对快照精确目标 ───────────────
+{
+	const targetSha = 'a'.repeat(40);
+	const otherSha = 'b'.repeat(40);
+	const cases = [
+		{
+			label: 'registry 版本不符明确失败',
+			plugin: { name: 'already-reg', kind: 'registry', version: '1.0.0' },
+			bundles: [{ name: 'already-reg', installed: true, version: '2.0.0', source: '2.0.0' }],
+			expected: 'failed', detail: /2\.0\.0.*1\.0\.0|1\.0\.0.*2\.0\.0/,
+		},
+		{
+			label: 'registry 版本一致才是 already',
+			plugin: { name: 'already-reg', kind: 'registry', version: '1.0.0' },
+			bundles: [{ name: 'already-reg', installed: true, version: '1.0.0', source: '1.0.0' }],
+			expected: 'already',
+		},
+		{
+			label: 'registry 无法读取已装版本时 unresolved',
+			plugin: { name: 'already-reg', kind: 'registry', version: '1.0.0' },
+			bundles: [], expected: 'unresolved', detail: /无法确认/,
+		},
+		{
+			label: 'git commit 不符明确失败',
+			plugin: { name: 'already-git', kind: 'git', spec: `github:o/r#${targetSha}` },
+			bundles: [{ name: 'already-git', installed: true, version: '1.0.0', source: `github:o/r#${otherSha}` }],
+			expected: 'failed', detail: new RegExp(otherSha),
+		},
+		{
+			label: 'git commit 一致才是 already',
+			plugin: { name: 'already-git', kind: 'git', spec: `github:o/r#${targetSha}` },
+			bundles: [{ name: 'already-git', installed: true, version: '1.0.0', spec: `git+https://github.com/o/r.git#${targetSha}` }],
+			expected: 'already',
+		},
+	];
+	for (const item of cases) {
+		const dir = await profileFixture();
+		const manager = {
+			calls: 0,
+			async installBundle() {
+				this.calls += 1;
+				return { application: 'failed', error: { code: 'already-installed', diagnostic: 'already present' } };
+			},
+			async listBundles() { return item.bundles; },
+		};
+		const rows = await restore({ manager, snapshot: { plugins: [item.plugin] }, dryRun: false, profileDir: dir, profile: 'desktop' });
+		const row = rows.find((r) => r.name === item.plugin.name);
+		check(item.label, row.status === item.expected && (item.detail === undefined || item.detail.test(String(row.detail))), JSON.stringify(row));
+		check(`${item.label}：没有盲目重试安装`, manager.calls === 1, String(manager.calls));
+		if (item.expected !== 'already') {
+			check(`${item.label}：汇总不算安装成功`, summarizeReport(rows).installed === 0, JSON.stringify(summarizeReport(rows)));
+		}
+		await rm(dir, { recursive: true, force: true });
+	}
+}
+
+// ── 19. already-installed 即使目标一致，也必须恢复旧 link ────
+{
+	const root = await mkdtemp(join(tmpdir(), 'pc-restore-already-link-'));
+	const profileDir = join(root, 'profile');
+	const sourceDir = join(root, 'source');
+	const entry = join(profileDir, 'node_modules', 'already-linked');
+	const sha = 'c'.repeat(40);
+	await mkdir(join(profileDir, 'node_modules'), { recursive: true });
+	await mkdir(sourceDir, { recursive: true });
+	await writeFile(join(sourceDir, 'marker.txt'), 'still here', 'utf8');
+	await symlink(sourceDir, entry, 'junction');
+	const beforeTarget = await readlink(entry);
+	const manager = {
+		async installBundle() {
+			return { application: 'failed', error: { code: 'already-installed', diagnostic: 'same git spec' } };
+		},
+		async listBundles() {
+			return [{ name: 'already-linked', installed: true, version: '1.0.0', source: `github:o/r#${sha}` }];
+		},
+	};
+	const rows = await restore({
+		manager,
+		snapshot: { plugins: [{ name: 'already-linked', kind: 'git', spec: `github:o/r#${sha}` }] },
+		dryRun: false, profileDir, profile: 'desktop',
+	});
+	const row = rows.find((r) => r.name === 'already-linked');
+	const restored = await lstat(entry).catch(() => null);
+	check('already 目标一致仍报告 already', row.status === 'already', JSON.stringify(row));
+	check('already 不是实际安装，旧 link 必须恢复', restored?.isSymbolicLink() === true, JSON.stringify(row));
+	check('already 恢复的 link 目标精确一致', restored?.isSymbolicLink() === true && await readlink(entry) === beforeTarget);
+	check('already 恢复 link 后源目录仍在', await readFile(join(sourceDir, 'marker.txt'), 'utf8') === 'still here');
+	await rm(root, { recursive: true, force: true });
+}
+
+// ── 20. 失败安装留下真实目录时，不得为了恢复 link 而覆盖 ────
+{
+	const root = await mkdtemp(join(tmpdir(), 'pc-restore-occupied-'));
+	const profileDir = join(root, 'profile');
+	const sourceDir = join(root, 'source');
+	const entry = join(profileDir, 'node_modules', 'occupied-pkg');
+	await mkdir(join(profileDir, 'node_modules'), { recursive: true });
+	await mkdir(sourceDir, { recursive: true });
+	await writeFile(join(sourceDir, 'original.txt'), 'original', 'utf8');
+	await symlink(sourceDir, entry, 'junction');
+	const manager = {
+		async installBundle() {
+			await mkdir(entry, { recursive: true });
+			await writeFile(join(entry, 'new.txt'), 'new install', 'utf8');
+			return { application: 'failed', error: { code: 'operation-error', diagnostic: 'partial install' } };
+		},
+	};
+	const rows = await restore({
+		manager,
+		snapshot: { plugins: [{ name: 'occupied-pkg', kind: 'git', spec: 'github:o/r#dddddddddddddddddddddddddddddddddddddddd' }] },
+		dryRun: false, profileDir, profile: 'desktop',
+	});
+	const row = rows.find((r) => r.name === 'occupied-pkg');
+	const after = await lstat(entry);
+	check('占用目标是真实目录且未被 link 替换', after.isDirectory() && !after.isSymbolicLink(), JSON.stringify(row));
+	check('新目录与源目录内容都未删除',
+		await readFile(join(entry, 'new.txt'), 'utf8') === 'new install' && await readFile(join(sourceDir, 'original.txt'), 'utf8') === 'original');
+	check('无法恢复 link 时报告明确失败原因', row.status === 'failed' && String(row.detail).includes('未覆盖') && String(row.detail).includes('未恢复'), String(row.detail));
+	await rm(root, { recursive: true, force: true });
+}
+
+// ── 21. registry 快照缺精确版本时拒绝安装最新版 ──────────────
+{
+	const dir = await profileFixture();
+	let calls = 0;
+	const manager = { async installBundle() { calls += 1; return { application: 'applied' }; } };
+	const snapshot = { plugins: [{ name: 'unversioned', kind: 'registry' }] };
+	const actual = await restore({ manager, snapshot, dryRun: false, profileDir: dir, profile: 'desktop' });
+	const planned = await restore({ manager, snapshot, dryRun: true, profileDir: dir, profile: 'desktop' });
+	const actualRow = actual.find((r) => r.name === 'unversioned');
+	const plannedRow = planned.find((r) => r.name === 'unversioned');
+	check('registry 缺版本明确 unresolved 且不安装', actualRow.status === 'unresolved' && String(actualRow.detail).includes('精确版本') && calls === 0, JSON.stringify(actualRow));
+	check('registry 缺版本的 dryRun 也不伪装成可安装计划', plannedRow.status === 'unresolved' && calls === 0, JSON.stringify(plannedRow));
+	await rm(dir, { recursive: true, force: true });
+}
+
+// ── 22. scoped 包恢复 link 前重建父目录 ───────────────────────
+{
+	const root = await mkdtemp(join(tmpdir(), 'pc-restore-scoped-'));
+	const profileDir = join(root, 'profile');
+	const sourceDir = join(root, 'source');
+	const scopeDir = join(profileDir, 'node_modules', '@scope');
+	const entry = join(scopeDir, 'pkg');
+	await mkdir(scopeDir, { recursive: true });
+	await mkdir(sourceDir, { recursive: true });
+	await writeFile(join(sourceDir, 'marker.txt'), 'scoped', 'utf8');
+	await symlink(sourceDir, entry, 'junction');
+	const beforeTarget = await readlink(entry);
+	const unlinked = await unlinkNodeModulesEntry(profileDir, '@scope/pkg');
+	await rm(scopeDir, { recursive: true, force: true });
+	const restored = await restoreNodeModulesEntry(profileDir, '@scope/pkg', unlinked);
+	check('scoped 包父目录缺失时仍能恢复 link', restored.kind === 'restored' && (await lstat(entry)).isSymbolicLink(), JSON.stringify(restored));
+	check('scoped 包恢复目标不变且源目录未动', await readlink(entry) === beforeTarget && await readFile(join(sourceDir, 'marker.txt'), 'utf8') === 'scoped');
+	await rm(root, { recursive: true, force: true });
 }
 
 console.log(`\n${passed} checks passed`);

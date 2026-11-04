@@ -19,7 +19,8 @@
  *
  * @module dsh-plugin-cloud
  */
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { lstat, mkdir, symlink } from "node:fs/promises";
 import { homedir } from "node:os";
 
 import { load as loadConfig, save as saveConfig, normalize, cloudReady, DEFAULTS, FIELDS, configFile } from "./lib/config.js";
@@ -252,6 +253,31 @@ export function apply(ctx, rawConfig) {
 		return typeof on === "function" ? on : () => {};
 	}, "plugin-cloud/change-watch");
 
+	/** Restore only the link this upgrade removed, never an installer's files. */
+	async function restoreRemovedNodeModulesEntry(profileDir, packageName, removed) {
+		if (removed?.kind !== "removed") return { ok: true };
+		if (typeof removed.target !== "string" || removed.target === "") {
+			return { ok: false, error: "missing-link-target" };
+		}
+		const entry = join(profileDir, "node_modules", packageName);
+		try {
+			await lstat(entry);
+			return { ok: false, error: "entry-already-exists" };
+		} catch (error) {
+			if (error?.code !== "ENOENT") {
+				return { ok: false, error: error instanceof Error ? error.message : String(error) };
+			}
+		}
+		try {
+			// A failed scoped-package install may also remove the @scope parent.
+			await mkdir(dirname(entry), { recursive: true });
+			await symlink(removed.target, entry, process.platform === "win32" ? "junction" : "dir");
+			return { ok: true };
+		} catch (error) {
+			return { ok: false, error: error instanceof Error ? error.message : String(error) };
+		}
+	}
+
 	/**
 	 * Run one upgrade job to completion, reporting each step as it starts.
 	 *
@@ -302,8 +328,17 @@ export function apply(ctx, rawConfig) {
 				// correctly marked "可更新" would have asked npm for a package that is
 				// not published there. Resolve per kind instead.
 				const current = (await (manager.listBundles?.() ?? [])).find((b) => b.name === name) ?? null;
-				const currentSpec = String(current?.spec ?? "");
-				const isGit = /^(git|git\+|github:)/.test(currentSpec) || /\.git(#|$)/.test(currentSpec);
+				const rawSpec = current?.spec ?? current?.installTarget?.spec;
+				const currentSpec = String(rawSpec ?? "");
+				const classifiedKind = current?.kind ?? classifySpec(rawSpec);
+				const isGit = classifiedKind === "git" || (current?.kind === undefined && (
+					/^(git|git\+|github:|git@|git:\/\/|ssh:\/\/)/.test(currentSpec) || /\.git(#|$)/.test(currentSpec)
+				));
+				const currentKind = isGit ? "git" : classifiedKind;
+				if (currentKind === "path") throw new Error("path-upgrade-blocked");
+				if (currentKind !== "registry" && currentKind !== "git") {
+					throw new Error("unsupported-upgrade-kind");
+				}
 
 				let targetSpec = null;
 				if (isGit) {
@@ -318,7 +353,8 @@ export function apply(ctx, rawConfig) {
 					row.spec = `github:${slug}#${tip}`;
 					targetSpec = row.spec;
 				} else {
-					const packument = await fetchPackument(name, cfg.registry);
+					const { registry } = await cfgNow();
+					const packument = await fetchPackument(name, registry);
 					row.to = packument?.latest ?? null;
 					row.spec = row.to === null ? null : `${name}@${row.to}`;
 					targetSpec = row.spec;
@@ -353,14 +389,39 @@ export function apply(ctx, rawConfig) {
 				// Clearing it first is what lets the replacement land.
 				const unlinked = await unlinkNodeModulesEntry(dir, name);
 				advance(3, "installing");
-				const outcome = await replaceDependency({
-					manager,
-					dir,
-					name,
-					spec: targetSpec,
-					installOptions: { saveExact: true },
-				});
-				if (unlinked.kind === "removed") row.unlinked = unlinked.target ?? true;
+				let outcome = null;
+				let installError = null;
+				try {
+					outcome = await replaceDependency({
+						manager,
+						dir,
+						name,
+						spec: targetSpec,
+						installOptions: { saveExact: true },
+					});
+				} catch (error) {
+					installError = error;
+				}
+				if (unlinked.kind === "removed") {
+					row.unlinked = unlinked.target ?? true;
+					if (outcome?.ok !== true) {
+						const linkRestore = await restoreRemovedNodeModulesEntry(dir, name, unlinked);
+						row.linkRestored = linkRestore.ok;
+						if (!linkRestore.ok) {
+							const original = installError instanceof Error
+								? installError.message
+								: outcome?.error ?? outcome?.errorCode ?? String(installError ?? "install-failed");
+							outcome = {
+								ok: false,
+								errorCode: "link-restore-failed",
+								error: `${original}; link restore failed: ${linkRestore.error ?? "unknown"}`,
+								restored: outcome?.restored,
+							};
+							installError = null;
+						}
+					}
+				}
+				if (installError !== null) throw installError;
 
 				advance(4, "verifying");
 				row.ok = outcome.ok === true;
@@ -493,7 +554,14 @@ export function apply(ctx, rawConfig) {
 						installOptions: { saveExact: true },
 					}),
 				});
-				if (unlinked.kind === "removed") row.unlinked = unlinked.target ?? true;
+				let linkRestore = null;
+				if (unlinked.kind === "removed") {
+					row.unlinked = unlinked.target ?? true;
+					if (guarded.ok !== true && guarded.outcome?.ok !== true) {
+						linkRestore = await restoreRemovedNodeModulesEntry(dir, name, unlinked);
+						row.linkRestored = linkRestore.ok;
+					}
+				}
 
 				advance(5, "verifying");
 				const outcome = guarded.outcome ?? {};
@@ -502,8 +570,13 @@ export function apply(ctx, rawConfig) {
 				row.application = outcome.application ?? null;
 				row.detached = guarded.detached === true;
 				if (!row.ok) {
-					row.errorCode = guarded.error ?? outcome.errorCode ?? "operation-error";
-					row.error = guarded.error ?? outcome.error ?? row.errorCode;
+					const originalError = guarded.error ?? outcome.error ?? outcome.errorCode ?? "operation-error";
+					row.errorCode = linkRestore?.ok === false
+						? "link-restore-failed"
+						: guarded.error ?? outcome.errorCode ?? "operation-error";
+					row.error = linkRestore?.ok === false
+						? `${originalError}; link restore failed: ${linkRestore.error ?? "unknown"}`
+						: originalError;
 					row.restored = outcome.restored ?? null;
 					// A failed re-attach means the plugin is no longer selected: say so
 					// loudly, because that is a worse state than a failed subscribe.
@@ -567,7 +640,7 @@ export function apply(ctx, rawConfig) {
 			results: rows,
 			summary: summarizeReport(rows),
 			restartRequired,
-			ok: rows.every((r) => r.status !== "failed"),
+			ok: rows.every((r) => ["installed", "installed-restart", "already"].includes(r.status)),
 		});
 	}
 
@@ -883,7 +956,8 @@ export function apply(ctx, rawConfig) {
 							subscriptions: plans,
 							summary: {
 								...snap.summary,
-								updatable: rows.filter((r) => r.update?.updateAvailable === true).length,
+								updatable: rows.filter((r) => r.update?.updateAvailable === true
+									&& r.name !== SELF_NAME && (r.kind === "registry" || r.kind === "git")).length,
 								subscribable: plans.filter((p) => p.ready).length,
 							},
 							// The user's own plugin (this one) is never offered for self-upgrade.

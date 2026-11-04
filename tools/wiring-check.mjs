@@ -40,6 +40,10 @@ const jobsRaw = await readFile(join(ROOT, 'lib', 'jobs.js'), 'utf8');
 		body.includes('unlinkNodeModulesEntry'), body.slice(0, 200));
 	check('订阅流程仍然调用 installDetached',
 		body.includes('installDetached'));
+	check('★ 订阅安装失败也恢复移除的链接',
+		body.includes('restoreRemovedNodeModulesEntry')
+		&& body.includes('guarded.outcome?.ok !== true')
+		&& body.includes('link-restore-failed'));
 	// 顺序很重要：必须先移除链接，再安装
 	const unlinkAt = body.indexOf('unlinkNodeModulesEntry');
 	const installAt = body.indexOf('installDetached');
@@ -56,6 +60,10 @@ const jobsRaw = await readFile(join(ROOT, 'lib', 'jobs.js'), 'utf8');
 	const restorerRaw = await readFile(join(ROOT, 'lib', 'restorer.js'), 'utf8');
 	check('restore 的 git 分支清理 node_modules 链接',
 		restorerRaw.includes('unlinkNodeModulesEntry'));
+	const restoreBody = hostRaw.slice(start, hostRaw.indexOf('\n\tasync function ', start + 10));
+	check('★ manual/unresolved 不再被当作装回成功',
+		restoreBody.includes('["installed", "installed-restart", "already"].includes(r.status)')
+		&& !restoreBody.includes('rows.every((r) => r.status !== "failed")'));
 }
 
 // ── 3. 三个耗时操作都必须是任务式 ───────────────────────────
@@ -119,16 +127,12 @@ const jobsRaw = await readFile(join(ROOT, 'lib', 'jobs.js'), 'utf8');
 // 前端把 git 行标成「可更新」却没有按钮，后端 /upgrade 又只会问 npm ——
 // 两条都断了，于是「可更新」是个死标签。
 {
-	// 前端：按钮不能只给 registry
+	// 前端：批量与单按钮都必须调用同一个 helper，避免条件再次漂移。
 	const canUpgradeLine = clientRaw.split('\n').find((l) => l.includes('const canUpgrade ='));
 	check('找到 canUpgrade 判定', canUpgradeLine !== undefined);
-	// 判定可以写成内联条件，也可以抽成 upgradableKind 变量，所以检查的是
-	// 「git 被纳入了可升级集合」，而不是某种具体写法。
-	const upgradeGate = (clientRaw.match(/const upgradableKind = [^;]+;/) ?? [''])[0]
-		+ (canUpgradeLine ?? '');
-	check('★ 升级按钮不再只限 registry',
-		/kind === 'git'/.test(upgradeGate) && !/canUpgrade = isUpdatable && p\.kind === 'registry'/.test(canUpgradeLine ?? ''),
-		String(upgradeGate).trim());
+	check('★ 单按钮与批量共用 canUpgradePlugin',
+		canUpgradeLine?.includes('canUpgradePlugin(p, data.selfName)') === true
+		&& clientRaw.includes('rows.filter((r) => canUpgradePlugin(r, data?.selfName))'));
 	check('自身不可升级时给出说明',
 		clientRaw.includes('selfUpgradeNote'), '缺少 selfUpgradeNote');
 
@@ -144,6 +148,20 @@ const jobsRaw = await readFile(join(ROOT, 'lib', 'jobs.js'), 'utf8');
 	const upgradeBody = hostRaw.slice(upgradeStart, hostRaw.indexOf('async function runSubscribeJob('));
 	check('★ 升级也移除 node_modules 链接',
 		upgradeBody.includes('unlinkNodeModulesEntry'), '升级流程没清链接');
+	check('★ registry 地址从 cfgNow 读取',
+		upgradeBody.includes('const { registry } = await cfgNow()')
+		&& upgradeBody.includes('fetchPackument(name, registry)')
+		&& !upgradeBody.includes('fetchPackument(name, cfg.registry)'));
+	check('★ path/未知来源在 registry 请求前被拒绝',
+		upgradeBody.includes('classifySpec(rawSpec)')
+		&& upgradeBody.indexOf('path-upgrade-blocked') >= 0
+		&& upgradeBody.indexOf('unsupported-upgrade-kind') >= 0
+		&& upgradeBody.indexOf('path-upgrade-blocked') < upgradeBody.indexOf('fetchPackument(name, registry)')
+		&& upgradeBody.indexOf('unsupported-upgrade-kind') < upgradeBody.indexOf('fetchPackument(name, registry)'));
+	check('★ 升级失败恢复链接且恢复失败有错误码',
+		upgradeBody.includes('restoreRemovedNodeModulesEntry')
+		&& upgradeBody.includes('row.linkRestored')
+		&& upgradeBody.includes('link-restore-failed'));
 }
 
 // ── 9. 升级同类问题：git 与 registry 的「已是最新」判定不同 ──
@@ -182,6 +200,61 @@ const jobsRaw = await readFile(join(ROOT, 'lib', 'jobs.js'), 'utf8');
 {
 	check('有 self-update 徽标样式',
 		clientRaw.includes('.pc-badge.self-update'), '缺 CSS');
+}
+
+// ── 12. 前端升级资格的行为回归，而不是只找一行字符串 ─────────────
+{
+	const match = clientRaw.match(/\t\tfunction canUpgradePlugin\(plugin, selfName\) \{[\s\S]*?\n\t\t\}/);
+	check('找到可独立执行的 canUpgradePlugin', match !== null);
+	if (match !== null) {
+		const source = `${match[0]}\nexport { canUpgradePlugin };`;
+		const url = `data:text/javascript;base64,${Buffer.from(source).toString('base64')}`;
+		const { canUpgradePlugin } = await import(url);
+		const row = (kind, extra = {}) => ({ name: 'example', kind, update: { updateAvailable: true }, ...extra });
+		check('★ registry/git 都可升级', canUpgradePlugin(row('registry'), 'self')
+			&& canUpgradePlugin(row('git'), 'self'));
+		check('★ path/tarball/unknown 不可升级', !canUpgradePlugin(row('path'), 'self')
+			&& !canUpgradePlugin(row('tarball'), 'self') && !canUpgradePlugin(row('unknown'), 'self'));
+		check('★ 自身与无更新都不可升级', !canUpgradePlugin(row('registry'), 'example')
+			&& !canUpgradePlugin(row('registry', { update: { updateAvailable: false } }), 'self'));
+		check('★ 保持 disabled 插件原有升级语义',
+			canUpgradePlugin(row('registry', { enabled: false }), 'self'));
+	}
+}
+
+// ── 13. 前后端可更新数量使用同一口径 ─────────────────────────
+{
+	const summaryAt = hostRaw.indexOf('updatable: rows.filter');
+	const summaryLine = hostRaw.slice(summaryAt, summaryAt + 260);
+	check('★ Host summary 排除自身与 path/未知来源',
+		summaryLine.includes('r.name !== SELF_NAME')
+		&& summaryLine.includes('r.kind === "registry"')
+		&& summaryLine.includes('r.kind === "git"'), summaryLine);
+}
+
+// ── 14. 装回确认分支消费最终 Job，删除失败不再被吞掉 ─────────────
+{
+	const start = clientRaw.indexOf('function VersionsPanel(');
+	const end = clientRaw.indexOf('function SettingsPanel(', start);
+	const body = clientRaw.slice(start, end);
+	check('★ 装回确认分支轮询 Job 并显示进度',
+		body.includes('pollJob(body.job.id, setJob)') && body.includes('h(JobProgress, { t, job })'));
+	check('★ 装回报告使用 final.results/final.summary',
+		body.includes('rows: final.results ?? []') && body.includes('summary: final.summary'));
+	check('★ dry-run 仍同步使用 body.report',
+		body.includes('rows: body.report ?? []') && body.includes('dryRun: true'));
+	check('★ 删除检查 HTTP/local/cloud 错误',
+		body.includes('body.error ?? body.local?.error ?? body.cloud?.error')
+		&& body.includes('if (!res.ok || failure) throw new Error'));
+}
+
+// ── 15. 新增机器码均有中英文案 ───────────────────────────────
+{
+	for (const key of ['errPathUpgradeBlocked', 'errUnsupportedUpgradeKind', 'errLinkRestoreFailed', 'blockPushUnverified']) {
+		const uses = clientRaw.split('\n').filter((line) => line.includes(`${key}:`)).length;
+		check(`${key} 中英文文案齐全`, uses === 2, String(uses));
+	}
+	check('push-unverified blocker 已接线', clientRaw.includes("'push-unverified': 'blockPushUnverified'"));
 }
 
 console.log(`\n${passed} checks passed`);

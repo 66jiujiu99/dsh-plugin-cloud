@@ -16,12 +16,13 @@
  *
  * Run: node tools/e2e-subscribe.mjs
  */
-import { mkdtemp, mkdir, writeFile, readFile, rm, lstat, symlink, readdir, access } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, rm, lstat, symlink, readdir, readlink, access } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 
 import { apply } from '../index.js';
+import { unlinkNodeModulesEntry } from '../lib/detach.js';
 
 let passed = 0;
 let skipped = 0;
@@ -80,6 +81,7 @@ function makeManager() {
 	const seen = [];
 	return {
 		seen,
+		failNextInstall: false,
 		async listBundles() {
 			return [{ name: pluginName, version: '1.0.0', installed: true, enabled: true }];
 		},
@@ -96,6 +98,9 @@ function makeManager() {
 				entryIsLink: isLink,
 				selected: (manifest.dsh?.profile?.bundles ?? []).includes(pluginName),
 			});
+			if (this.failNextInstall === true) {
+				return { application: 'failed', error: { code: 'operation-error', diagnostic: 'mock subscribe failure' } };
+			}
 			// 模拟安装成功：把依赖写成 git spec，建一个真实目录
 			manifest.dependencies[pluginName] = spec;
 			await writeFile(join(profileDir, 'package.json'), `${JSON.stringify(manifest, undefined, 2)}\n`, 'utf8');
@@ -260,7 +265,34 @@ if (commit !== null && typeof handler === 'function') {
 	check('源目录文件仍在', pkgStillThere);
 }
 
-// ── 5. 第二个订阅应被 409 挡住（单任务互斥）──────────────────
+// ── 5. 真实失败链路：任务行失败，但 bundle 与原 junction 都恢复 ──
+if (commit !== null && typeof handler === 'function') {
+	const entry = join(profileDir, 'node_modules', pluginName);
+	const manifest = JSON.parse(await readFile(join(profileDir, 'package.json'), 'utf8'));
+	manifest.dependencies[pluginName] = `link:${sourceDir.replace(/\\/g, '/')}`;
+	if (!(manifest.dsh?.profile?.bundles ?? []).includes(pluginName)) manifest.dsh.profile.bundles.push(pluginName);
+	await writeFile(join(profileDir, 'package.json'), `${JSON.stringify(manifest, undefined, 2)}\n`, 'utf8');
+	await rm(entry, { recursive: true, force: true });
+	await symlink(sourceDir, entry, 'junction');
+	const beforeTarget = await readlink(entry);
+	fakeManager.failNextInstall = true;
+
+	const start = await request('POST', '/api/plugin-cloud/subscribe', { names: [pluginName] });
+	check('失败订阅仍返回 202 job', start.status === 202 && typeof start.json?.job?.id === 'string', `${start.status} ${start.raw.slice(0, 150)}`);
+	const final = start.json?.job?.id ? await waitJob(start.json.job.id) : null;
+	const row = (final?.results ?? []).find((r) => r.name === pluginName);
+	check('失败订阅任务完成且行明确失败', final?.status === 'done' && row?.ok === false, JSON.stringify(final));
+	const afterManifest = JSON.parse(await readFile(join(profileDir, 'package.json'), 'utf8'));
+	check('失败订阅后 bundle 已 reattach', (afterManifest.dsh?.profile?.bundles ?? []).includes(pluginName), JSON.stringify(afterManifest.dsh?.profile?.bundles));
+	const restored = await lstat(entry).catch(() => null);
+	check('失败订阅后原 junction 已恢复', restored?.isSymbolicLink() === true, JSON.stringify(row));
+	check('恢复的 junction 精确指向原目标', restored?.isSymbolicLink() === true && await readlink(entry) === beforeTarget);
+	check('失败回滚没有删除源目录',
+		await readFile(join(sourceDir, 'package.json'), 'utf8').then(() => true).catch(() => false)
+		&& await readFile(join(sourceDir, '.git', 'HEAD'), 'utf8').then(() => true).catch(() => false));
+}
+
+// ── 6. 第二个订阅应被 409 挡住（单任务互斥）──────────────────
 if (commit !== null && typeof handler === 'function') {
 	// 先把状态复位成一个新的 link: 插件，模拟并发
 	const busy = await request('POST', '/api/plugin-cloud/subscribe', { names: [] });
@@ -278,7 +310,9 @@ if (commit !== null && typeof handler === 'function') {
 		String(row?.errorCode).includes('self-subscribe-blocked'), String(row?.errorCode));
 }
 
-await rm(root, { recursive: true, force: true });
+// 失败用例刻意留下恢复后的 junction；先解除链接，避免 Windows 递归清理源目录时 EBUSY。
+await unlinkNodeModulesEntry(profileDir, pluginName);
+await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 console.log(`\n${passed} checks passed${skipped > 0 ? `, ${skipped} skipped` : ''}`);
 // 插件会启动自动备份的定时器，测试进程不会自己退出。结论已经打印出来了，
 // 直接结束进程；挂住等它自然退出只会让 CI 超时。

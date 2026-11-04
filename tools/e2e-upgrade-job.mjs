@@ -18,10 +18,11 @@
  *
  * Run: node tools/e2e-upgrade-job.mjs
  */
-import { mkdtemp, mkdir, writeFile, readFile, rm, lstat, readdir, access, symlink } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, rm, lstat, realpath, symlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
+import { createServer } from 'node:http';
 
 import { apply } from '../index.js';
 
@@ -81,6 +82,8 @@ await writeFile(join(profileDir, 'package.json'), `${JSON.stringify({
 	dependencies: {
 		[gitPlugin]: pinnedSpec,
 		registryPlugin: '1.0.0',
+		pathPlugin: 'file:../registryPlugin',
+		unknownPlugin: 'https://example.com/plugin.tgz',
 	},
 	dsh: { profile: { bundles: [gitPlugin, 'registryPlugin'] } },
 }, undefined, 2)}\n`, 'utf8');
@@ -99,31 +102,73 @@ process.env.DSH_PROFILE_DIR = profileDir;
 // 查一个不存在的地方，整条 git 升级链路根本没法端到端测。
 process.env.DSH_PLUGIN_CLOUD_GIT_URL = sourceDir;
 
-// ── 假 manager：记录调用时刻的磁盘状态 ─────────────────────
+// 真正的本地 registry：不是 mock fetchPackument，升级 handler 会按配置发 HTTP。
+const registryRequests = [];
+const registryServer = createServer((req, res) => {
+	registryRequests.push(req.url);
+	if (req.url === '/custom-registry/registryPlugin') {
+		res.writeHead(200, { 'content-type': 'application/json' });
+		res.end(JSON.stringify({ 'dist-tags': { latest: '1.1.0' }, versions: { '1.1.0': {} } }));
+		return;
+	}
+	res.writeHead(404, { 'content-type': 'application/json' });
+	res.end('{}');
+});
+await new Promise((resolve) => registryServer.listen(0, '127.0.0.1', resolve));
+const registryAddress = registryServer.address();
+const registryUrl = `http://127.0.0.1:${registryAddress.port}/custom-registry`;
+await mkdir(join(root, 'dsh-plugin-cloud'), { recursive: true });
+await writeFile(join(root, 'dsh-plugin-cloud', 'config.json'), `${JSON.stringify({ registry: registryUrl })}\n`, 'utf8');
+
+// ── 假 manager：记录调用时刻的磁盘状态并执行实际 manifest 变更 ─────────────
 /** @returns {object} manager stub */
+let failNextInstall = false;
+let leaveRealDirectoryOnFailure = false;
 function makeManager() {
 	const calls = [];
 	return {
 		calls,
 		async listBundles() {
-			// `spec` 必须读当前的 manifest，不能固定成构造时的值：升级改的正是
-			// 这一行，假件若一直返回旧 spec，「已是最新」判定永远不成立——那测的
-			// 就不是产品逻辑，而是假件自己的陈旧副本。
-			let spec = pinnedSpec;
-			try {
-				const m = JSON.parse(await readFile(join(profileDir, 'package.json'), 'utf8'));
-				spec = m.dependencies?.[gitPlugin] ?? pinnedSpec;
-			} catch { /* 读不到就退回初始值 */ }
+			let manifest = { dependencies: {} };
+			try { manifest = JSON.parse(await readFile(join(profileDir, 'package.json'), 'utf8')); } catch { /* use defaults */ }
+			const spec = manifest.dependencies?.[gitPlugin] ?? pinnedSpec;
+			const registrySpec = manifest.dependencies?.registryPlugin ?? '1.0.0';
 			return [
 				{ name: gitPlugin, version: '1.0.0', installed: true, enabled: true, spec },
-				{ name: 'registryPlugin', version: '1.0.0', installed: true, enabled: true, spec: '1.0.0' },
+				{ name: 'registryPlugin', version: registrySpec, installed: true, enabled: true, spec: registrySpec },
+				{ name: 'pathPlugin', version: '1.0.0', installed: true, enabled: true, spec: 'file:../registryPlugin' },
+				{ name: 'unknownPlugin', version: '1.0.0', installed: true, enabled: true, spec: 'https://example.com/plugin.tgz' },
 			];
 		},
 		async installBundle(spec) {
-			const entry = join(profileDir, 'node_modules', gitPlugin);
+			const packageName = spec === 'registryPlugin@1.1.0' ? 'registryPlugin' : gitPlugin;
+			const entry = join(profileDir, 'node_modules', packageName);
 			let entryExists = true;
 			try { await lstat(entry); } catch { entryExists = false; }
-			calls.push({ spec, entryExistsAtInstall: entryExists });
+			calls.push({ spec, packageName, entryExistsAtInstall: entryExists });
+			if (failNextInstall) {
+				failNextInstall = false;
+				if (leaveRealDirectoryOnFailure) {
+					leaveRealDirectoryOnFailure = false;
+					await mkdir(entry, { recursive: true });
+					await writeFile(join(entry, 'installer-left-this.txt'), 'keep\n', 'utf8');
+				}
+				return { application: 'restart-required', error: { code: 'e2e-install-failed' } };
+			}
+			if (packageName === 'registryPlugin' && entryExists) {
+				// 驱动真实 already-installed → drop → retry；失败安装同时清掉旧包，
+				// 第二次调用必须真的发生并写回 manifest，不能只伪造最终成功响应。
+				await rm(entry, { recursive: true, force: true });
+				return { application: 'restart-required', error: { code: 'already-installed' } };
+			}
+			const manifestPath = join(profileDir, 'package.json');
+			const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
+			manifest.dependencies[packageName] = packageName === 'registryPlugin' ? '1.1.0' : spec;
+			await writeFile(manifestPath, `${JSON.stringify(manifest, undefined, 2)}\n`, 'utf8');
+			await mkdir(entry, { recursive: true });
+			await writeFile(join(entry, 'package.json'), `${JSON.stringify({
+				name: packageName, version: packageName === 'registryPlugin' ? '1.1.0' : '1.0.0',
+			})}\n`, 'utf8');
 			return { application: 'restart-required' };
 		},
 	};
@@ -198,7 +243,37 @@ async function waitJob(id, timeoutMs = 20000) {
 	}
 }
 
-// ── 1. git 依赖落后一个提交 → 应该能升 ─────────────────────
+// ── 1. 安装失败必须恢复本次移除的 junction，且不覆盖真实目录 ─────────────
+if (firstCommit !== null && secondCommit !== null) {
+	failNextInstall = true;
+	const start = await request('POST', '/api/plugin-cloud/upgrade', { names: [gitPlugin] });
+	const final = start.json?.job?.id ? await waitJob(start.json.job.id) : null;
+	const row = (final?.results ?? [])[0] ?? {};
+	const entry = join(profileDir, 'node_modules', gitPlugin);
+	check('安装失败返回原安装错误', row.ok === false && row.errorCode === 'e2e-install-failed', JSON.stringify(row));
+	check('失败结果明确标记链接已恢复', row.linkRestored === true, JSON.stringify(row));
+	check('★ 被移除的 junction 已恢复', (await lstat(entry)).isSymbolicLink());
+	check('★ 恢复链接仍指向原源目录', await realpath(entry) === await realpath(sourceDir));
+	const sourceManifest = JSON.parse(await readFile(join(sourceDir, 'package.json'), 'utf8'));
+	check('源目录没有被替换或删除', sourceManifest.name === gitPlugin, JSON.stringify(sourceManifest));
+	const manifest = JSON.parse(await readFile(join(profileDir, 'package.json'), 'utf8'));
+	check('失败后 manifest 仍固定旧 commit', manifest.dependencies[gitPlugin] === pinnedSpec, String(manifest.dependencies[gitPlugin]));
+
+	failNextInstall = true;
+	leaveRealDirectoryOnFailure = true;
+	const occupiedStart = await request('POST', '/api/plugin-cloud/upgrade', { names: [gitPlugin] });
+	const occupiedFinal = occupiedStart.json?.job?.id ? await waitJob(occupiedStart.json.job.id) : null;
+	const occupiedRow = (occupiedFinal?.results ?? [])[0] ?? {};
+	check('链接被真实目录占用时明确报错', occupiedRow.errorCode === 'link-restore-failed' && occupiedRow.linkRestored === false, JSON.stringify(occupiedRow));
+	check('★ 回滚不覆盖安装器留下的真实目录',
+		await readFile(join(entry, 'installer-left-this.txt'), 'utf8') === 'keep\n');
+	check('真实目录仍是目录而非链接', (await lstat(entry)).isDirectory() && !(await lstat(entry)).isSymbolicLink());
+	// 清理由安装器留下的测试目录，恢复后续成功用例所需的初始 junction。
+	await rm(entry, { recursive: true, force: true });
+	await symlink(sourceDir, entry, 'junction');
+}
+
+// ── 2. git 依赖落后一个提交 → 应该能升 ─────────────────────
 if (firstCommit !== null && secondCommit !== null) {
 	const start = await request('POST', '/api/plugin-cloud/upgrade', { names: [gitPlugin] });
 	check('升级返回 202', start.status === 202, `${start.status} ${start.raw.slice(0, 150)}`);
@@ -218,10 +293,13 @@ if (firstCommit !== null && secondCommit !== null) {
 
 	// ── 2. 安装前必须清掉 node_modules 旧条目 ─────────────
 	check('installBundle 被调用', fakeManager.calls.length >= 1, String(fakeManager.calls.length));
-	const call = fakeManager.calls[0] ?? {};
+	const call = fakeManager.calls.at(-1) ?? {};
 	check('★ 安装时旧目录已被移除（否则 Windows 上 EPERM）',
 		call.entryExistsAtInstall === false, JSON.stringify(call));
 	check('安装用的是 git spec', String(call.spec).startsWith('github:'), String(call.spec));
+	const manifest = JSON.parse(await readFile(join(profileDir, 'package.json'), 'utf8'));
+	check('成功安装确实写入新 git spec', manifest.dependencies[gitPlugin] === `github:example/e2e#${secondCommit}`,
+		String(manifest.dependencies[gitPlugin]));
 }
 
 // ── 3. 已是最新时不再安装 ──────────────────────────────────
@@ -243,7 +321,41 @@ if (firstCommit !== null) {
 		row.application === 'not-needed', String(row.application));
 }
 
-// ── 4. 自升级必须被拒绝 ────────────────────────────────────
+// ── 4. registry 走 cfgNow 配置、真实 HTTP、真实 install/retry 链 ─────────────
+{
+	const beforeRequests = registryRequests.length;
+	const beforeCalls = fakeManager.calls.length;
+	const start = await request('POST', '/api/plugin-cloud/upgrade', { names: ['registryPlugin'] });
+	const final = start.json?.job?.id ? await waitJob(start.json.job.id) : null;
+	const row = (final?.results ?? [])[0] ?? {};
+	check('★ registry 升级任务成功', row.ok === true && row.to === '1.1.0', JSON.stringify(row));
+	check('★ 请求使用 config.json 的自定义 registry 路径',
+		registryRequests.length === beforeRequests + 1 && registryRequests.at(-1) === '/custom-registry/registryPlugin',
+		JSON.stringify(registryRequests));
+	const calls = fakeManager.calls.slice(beforeCalls).filter((call) => call.packageName === 'registryPlugin');
+	check('★ registry 实际执行 install/retry 两次', calls.length === 2
+		&& calls.every((call) => call.spec === 'registryPlugin@1.1.0'), JSON.stringify(calls));
+	check('retry 前旧 registry 条目已由失败安装清理', calls[1]?.entryExistsAtInstall === false, JSON.stringify(calls));
+	const manifest = JSON.parse(await readFile(join(profileDir, 'package.json'), 'utf8'));
+	check('★ registry 成功结果写入 manifest', manifest.dependencies.registryPlugin === '1.1.0',
+		String(manifest.dependencies.registryPlugin));
+	const installed = JSON.parse(await readFile(join(profileDir, 'node_modules', 'registryPlugin', 'package.json'), 'utf8'));
+	check('★ registry 新包实际落盘', installed.version === '1.1.0', JSON.stringify(installed));
+}
+
+// ── 5. path/未知来源必须在联网和安装前明确拒绝 ─────────────────────
+for (const [name, errorCode] of [['pathPlugin', 'path-upgrade-blocked'], ['unknownPlugin', 'unsupported-upgrade-kind']]) {
+	const beforeRequests = registryRequests.length;
+	const beforeCalls = fakeManager.calls.length;
+	const start = await request('POST', '/api/plugin-cloud/upgrade', { names: [name] });
+	const final = start.json?.job?.id ? await waitJob(start.json.job.id) : null;
+	const row = (final?.results ?? [])[0] ?? {};
+	check(`${name} 被拒绝且错误码为 ${errorCode}`, row.ok === false && row.errorCode === errorCode, JSON.stringify(row));
+	check(`${name} 未访问 registry 且未调用安装`,
+		registryRequests.length === beforeRequests && fakeManager.calls.length === beforeCalls);
+}
+
+// ── 6. 自升级必须被拒绝 ────────────────────────────────────
 {
 	const start = await request('POST', '/api/plugin-cloud/upgrade', { names: ['dsh-plugin-cloud'] });
 	const final = start.json?.job?.id ? await waitJob(start.json.job.id) : null;
@@ -276,6 +388,8 @@ if (firstCommit !== null) {
 	if (b.json?.job?.id) await waitJob(b.json.job.id);
 }
 
-await rm(root, { recursive: true, force: true });
+await new Promise((resolve) => registryServer.close(resolve));
+// scheduler.force() 会在 Job 完成后异步落快照；Windows 下清理要允许这些写入收尾。
+await rm(root, { recursive: true, force: true, maxRetries: 30, retryDelay: 100 });
 console.log(`\n${passed} checks passed${skipped > 0 ? `, ${skipped} skipped` : ''}`);
 process.exit(process.exitCode ?? 0);

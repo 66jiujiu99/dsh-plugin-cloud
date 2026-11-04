@@ -11,6 +11,9 @@ import { setTimeout as sleep } from 'node:timers/promises';
 
 const SUITES = [
 	{ name: 'GitHub 协议与存储', file: 'tools/run-selftest.mjs' },
+	{ name: '本地快照存储', file: 'tools/store-check.mjs' },
+	{ name: '本地订阅', file: 'tools/subscriptions-local-check.mjs' },
+	{ name: '快照完整性', file: 'tools/snapshot-integrity-check.mjs' },
 	{ name: '中英文案与 locale', file: 'tools/locale-check.mjs' },
 	{ name: '版本检查与订阅', file: 'tools/versions-check.mjs' },
 	{ name: '表格对齐', file: 'tools/table-check.mjs' },

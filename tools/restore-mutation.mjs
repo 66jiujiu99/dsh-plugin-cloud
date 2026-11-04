@@ -28,8 +28,8 @@ const MUTATIONS = [
 	{
 		file: 'lib/restorer.js',
 		name: '装 git 版本前不清理 node_modules 链接',
-		from: '\t\t\t\tconst unlinked = await unlinkNodeModulesEntry(profileDir, entry.name);',
-		to: '\t\t\t\tconst unlinked = { kind: "absent" };',
+		from: '\t\t\t\tunlinked = await unlinkNodeModulesEntry(profileDir, entry.name);',
+		to: '\t\t\t\tunlinked = { kind: "absent" };',
 	},
 	{
 		file: 'lib/restorer.js',

@@ -56,6 +56,9 @@ window.__ModuleLoader__.load({
 			errNoRunningJob: '当前没有正在运行的升级任务',
 			errUnsupportedSpec: '快照里的安装地址无法识别，不能升级',
 			errRemoteUnreachable: '读不到远端仓库，暂时无法判断有没有更新',
+			errPathUpgradeBlocked: '本地目录插件不能直接升级，请先转为 Git 订阅',
+			errUnsupportedUpgradeKind: '这种安装来源不支持升级',
+			errLinkRestoreFailed: '升级失败，且被移除的插件链接未能恢复；请检查插件目录',
 			upgrade: '升级',
 			upgradeAll: '全部升级',
 			checkUpdates: '检查更新',
@@ -106,6 +109,7 @@ window.__ModuleLoader__.load({
 			report: '装回报告',
 			dryRun: '预检——没有写入任何东西',
 			realRun: '装回已执行',
+			restoreFailed: '装回失败，请查看报告或重试',
 			order: 'Bundle 顺序',
 			summary: '{total} 个插件 · {local} 个本地 · {disabled} 个已停用',
 			emptyRepo: '例如 your-name/dsh-env',
@@ -155,6 +159,7 @@ window.__ModuleLoader__.load({
 			blockNotGithub: '远程不是 GitHub 仓库',
 			blockDirty: '有未提交的改动',
 			blockUnpushed: '有提交还没推送',
+			blockPushUnverified: '无法确认当前提交已推送',
 			blockNoCommit: '仓库里还没有提交',
 			blockNameMismatch: '目录里的包名与依赖名不一致',
 			errNoCredentialService: '凭证服务不可用',
@@ -207,6 +212,9 @@ window.__ModuleLoader__.load({
 			errNoRunningJob: 'No upgrade job is running',
 			errUnsupportedSpec: 'The recorded install spec cannot be understood',
 			errRemoteUnreachable: 'The remote could not be read, so updates cannot be checked',
+			errPathUpgradeBlocked: 'Local directory plugins cannot be upgraded directly; subscribe to a Git repository first',
+			errUnsupportedUpgradeKind: 'This installation source does not support upgrades',
+			errLinkRestoreFailed: 'The upgrade failed and the removed plugin link could not be restored; inspect the plugin directory',
 			upgrade: 'Upgrade',
 			upgradeAll: 'Upgrade all',
 			checkUpdates: 'Check',
@@ -257,6 +265,7 @@ window.__ModuleLoader__.load({
 			report: 'Restore report',
 			dryRun: 'Dry run — nothing written',
 			realRun: 'Restore executed',
+			restoreFailed: 'Restore failed; inspect the report or retry',
 			order: 'Bundle order',
 			summary: '{total} plugins · {local} local · {disabled} disabled',
 			emptyRepo: 'e.g. your-name/dsh-env',
@@ -306,6 +315,7 @@ window.__ModuleLoader__.load({
 			blockNotGithub: 'The remote is not a GitHub repository',
 			blockDirty: 'There are uncommitted changes',
 			blockUnpushed: 'Some commits have not been pushed',
+			blockPushUnverified: 'Cannot confirm that the current commit has been pushed',
 			blockNoCommit: 'The repository has no commits yet',
 			blockNameMismatch: 'The package name in the directory differs from the dependency key',
 			errNotFound: 'Snapshot not found',
@@ -405,6 +415,11 @@ window.__ModuleLoader__.load({
 			'no-running-job': 'errNoRunningJob',
 			'unsupported-spec': 'errUnsupportedSpec',
 			'remote-unreachable': 'errRemoteUnreachable',
+			'path-upgrade-blocked': 'errPathUpgradeBlocked',
+			'unsupported-upgrade-kind': 'errUnsupportedUpgradeKind',
+			'link-restore-failed': 'errLinkRestoreFailed',
+			'missing-link-target': 'errLinkRestoreFailed',
+			'entry-already-exists': 'errLinkRestoreFailed',
 		};
 
 		/** Subscription blocker code → dictionary key. */
@@ -415,9 +430,17 @@ window.__ModuleLoader__.load({
 			'not-github': 'blockNotGithub',
 			'dirty': 'blockDirty',
 			'unpushed': 'blockUnpushed',
+			'push-unverified': 'blockPushUnverified',
 			'no-commit': 'blockNoCommit',
 			'name-mismatch': 'blockNameMismatch',
 		};
+
+		/** Batch and row actions deliberately share one eligibility rule. */
+		function canUpgradePlugin(plugin, selfName) {
+			return plugin?.update?.updateAvailable === true
+				&& plugin.name !== selfName
+				&& (plugin.kind === 'registry' || plugin.kind === 'git');
+		}
 
 		/** Translate one machine code, or return the raw text when unknown. */
 		function codeText(t, code) {
@@ -818,7 +841,7 @@ window.__ModuleLoader__.load({
 
 			const rows = data?.plugins ?? [];
 			const updatable = useMemo(
-				() => rows.filter((r) => r.update?.updateAvailable === true && r.name !== data?.selfName).map((r) => r.name),
+				() => rows.filter((r) => canUpgradePlugin(r, data?.selfName)).map((r) => r.name),
 				[rows, data]);
 
 			/**
@@ -1009,8 +1032,7 @@ window.__ModuleLoader__.load({
 				// subscribed plugin whose upstream moved on is exactly the case this
 				// tab exists for. Restricting the button to `registry` left a git row
 				// showing "可更新" with nothing to click.
-				const upgradableKind = p.kind === 'registry' || p.kind === 'git';
-				const canUpgrade = isUpdatable && upgradableKind && p.name !== data.selfName;
+				const canUpgrade = canUpgradePlugin(p, data.selfName);
 				// This plugin cannot upgrade itself: the install would replace the code
 				// handling the request, and Windows refuses to rename over a directory
 				// the running host holds open. The Host reports that as its own status
@@ -1148,6 +1170,8 @@ window.__ModuleLoader__.load({
 			const [error, setError] = useState(null);
 			const [report, setReport] = useState(null);
 			const [openVer, setOpenVer] = useState(null);
+			const [job, setJob] = useState(null);
+			const [notice, setNotice] = useState(null);
 
 			const load = useCallback(async () => {
 				try {
@@ -1177,8 +1201,21 @@ window.__ModuleLoader__.load({
 				finally { setBusy(false); }
 			}, [load, t, onChanged]);
 
+			const pollJob = useCallback(async (id, onUpdate) => {
+				for (;;) {
+					await new Promise((resolve) => { setTimeout(resolve, 400); });
+					try {
+						const res = await fetch(api(`/job?id=${encodeURIComponent(id)}`), { credentials: 'same-origin' });
+						const body = await res.json();
+						if (!res.ok || body.job === undefined) return null;
+						onUpdate(body.job);
+						if (body.job.status !== 'running') return body.job;
+					} catch { return null; }
+				}
+			}, []);
+
 			const runRestore = useCallback(async (file, confirm) => {
-				setBusy(true); setError(null);
+				setBusy(true); setError(null); setNotice(null); setReport(null); setJob(null);
 				try {
 					const res = await fetch(api('/restore'), {
 						method: 'POST', credentials: 'same-origin',
@@ -1187,23 +1224,39 @@ window.__ModuleLoader__.load({
 					});
 					const body = await res.json();
 					if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
-					setReport({ file, dryRun: body.dryRun, rows: body.report ?? [], summary: body.summary });
+					if (!confirm) {
+						setReport({ file, dryRun: true, rows: body.report ?? [], summary: body.summary });
+						return;
+					}
+					if (!body.job?.id) throw new Error('job-not-found');
+					setJob(body.job);
+					const final = await pollJob(body.job.id, setJob);
+					if (final === null) { setError(t('jobLost')); return; }
+					setReport({ file, dryRun: false, rows: final.results ?? [], summary: final.summary });
+					if (final.status !== 'done' || final.ok !== true) { setError(t('restoreFailed')); return; }
+					setNotice(t('realRun'));
+					await load();
+					onChanged?.();
 				} catch (e) { setError(errorText(t, e?.message ?? e)); }
-				finally { setBusy(false); }
-			}, [t]);
+				finally { setBusy(false); setJob(null); }
+			}, [load, onChanged, pollJob, t]);
 
 			const del = useCallback(async (file) => {
-				setBusy(true);
+				setBusy(true); setError(null); setNotice(null);
 				try {
-					await fetch(api('/delete'), {
+					const res = await fetch(api('/delete'), {
 						method: 'POST', credentials: 'same-origin',
 						headers: { 'content-type': 'application/json' },
 						body: JSON.stringify({ file }),
 					});
+					const body = await res.json();
+					const failure = body.error ?? body.local?.error ?? body.cloud?.error;
+					if (!res.ok || failure) throw new Error(failure ?? `HTTP ${res.status}`);
 					await load();
+					onChanged?.();
 				} catch (e) { setError(errorText(t, e?.message ?? e)); }
 				finally { setBusy(false); }
-			}, [load, t]);
+			}, [load, onChanged, t]);
 
 			const view = useCallback(async (file) => {
 				try {
@@ -1279,6 +1332,8 @@ window.__ModuleLoader__.load({
 
 			return h('div', { className: 'pc-root' },
 				error ? h('div', { className: 'pc-note err' }, error) : null,
+				notice ? h('div', { className: 'pc-note ok' }, notice) : null,
+				job ? h(JobProgress, { t, job }) : null,
 				h(Card, {
 					title: t('versions'),
 					extra: h('div', { style: { display: 'flex', gap: 8, alignItems: 'center' } },

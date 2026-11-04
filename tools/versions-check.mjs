@@ -1,12 +1,13 @@
 /**
  * 版本检查与订阅计划的单元测试。
  *
- * 不联网的部分（semver、状态判定、slug 解析）直接断言；联网的部分（npm
- * packument）跑真实请求，失败时只报 skip 而不让整套测试变红——网络不是
- * 这个插件的正确性条件。
+ * 不联网的部分（semver、状态判定、slug 解析）直接断言；registry 的关键
+ * 成功/失败语义用本地 HTTP fixture 验证。真实 npm / git 请求失败时只报
+ * skip 而不让整套测试变红——外网不是这个插件的正确性条件。
  *
  * Run: node tools/versions-check.mjs
  */
+import { createServer } from 'node:http';
 import * as v from '../lib/versions.js';
 import * as s from '../lib/subscriptions.js';
 
@@ -62,6 +63,73 @@ check('HTTPS 无 .git', v.githubSlug('https://github.com/o/r') === 'o/r');
 check('github: 简写', v.githubSlug('github:o/r') === 'o/r');
 check('非 GitHub 返回 null', v.githubSlug('https://gitlab.com/o/r.git') === null);
 check('非法输入返回 null', v.githubSlug(null) === null);
+
+// ── 本地 HTTP registry fixture ──────────────────────────────
+// 读取失败和“没有更新”必须区分开：503 时 latest/updateAvailable 虽仍为空/
+// false，但 note 必须让上层显示远端不可达，而不是误判为“最新”。
+{
+	const packuments = {
+		'fixture-plugin': {
+			'dist-tags': { latest: '2.0.0' },
+			versions: { '1.0.0': {}, '1.1.0': {}, '2.0.0': {} },
+			time: { '2.0.0': '2026-01-02T00:00:00.000Z' },
+		},
+		'current-plugin': {
+			'dist-tags': { latest: '1.0.0' },
+			versions: { '1.0.0': {} },
+			time: { '1.0.0': '2026-01-01T00:00:00.000Z' },
+		},
+	};
+	const server = createServer((req, res) => {
+		if (req.url === '/registry-down') {
+			res.writeHead(503, { 'content-type': 'application/json' });
+			res.end(JSON.stringify({ error: 'registry unavailable' }));
+			return;
+		}
+		const packument = packuments[decodeURIComponent((req.url ?? '/').slice(1))];
+		if (packument === undefined) {
+			res.writeHead(404, { 'content-type': 'application/json' });
+			res.end(JSON.stringify({ error: 'not found' }));
+			return;
+		}
+		res.writeHead(200, { 'content-type': 'application/json' });
+		res.end(JSON.stringify(packument));
+	});
+	await new Promise((resolve, reject) => {
+		server.once('error', reject);
+		server.listen(0, '127.0.0.1', resolve);
+	});
+	try {
+		const address = server.address();
+		if (address === null || typeof address === 'string') throw new Error('本地 registry fixture 未监听 TCP 端口');
+		const registry = `http://127.0.0.1:${address.port}`;
+		const out = await v.checkUpdates([
+			{ name: 'registry-down', kind: 'registry', version: '1.0.0' },
+			{ name: 'fixture-plugin', kind: 'registry', version: '1.0.0' },
+			{ name: 'current-plugin', kind: 'registry', version: '1.0.0' },
+		], { registry });
+
+		const down = out.get('registry-down');
+		check('registry 503 标 remote-unreachable 而非 current', down?.note === 'remote-unreachable', JSON.stringify(down));
+		check('registry 503 不伪造 latest', down?.latest === null, JSON.stringify(down));
+		check('registry 503 不伪造可更新状态', down?.updateAvailable === false, JSON.stringify(down));
+
+		const update = out.get('fixture-plugin');
+		check('正常 registry 仍能检出更新', update?.updateAvailable === true, JSON.stringify(update));
+		check('正常 registry 返回 latest', update?.latest === '2.0.0', JSON.stringify(update));
+		check('正常 registry 仍计算 behind', update?.behind === 2, JSON.stringify(update));
+		check('正常 registry 返回发布时间', update?.publishedAt === '2026-01-02T00:00:00.000Z', JSON.stringify(update));
+
+		const current = out.get('current-plugin');
+		check('网络成功且已最新时仍不可更新', current?.updateAvailable === false, JSON.stringify(current));
+		check('网络成功且已最新时 behind 仍为 0', current?.behind === 0, JSON.stringify(current));
+		check('网络成功时不新增失败 note', current !== undefined && !Object.hasOwn(current, 'note'), JSON.stringify(current));
+	} finally {
+		await new Promise((resolve, reject) => {
+			server.close((error) => error ? reject(error) : resolve());
+		});
+	}
+}
 
 // ── 真实 npm registry ───────────────────────────────────────
 {
