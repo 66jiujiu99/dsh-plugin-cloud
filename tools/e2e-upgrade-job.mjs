@@ -103,12 +103,14 @@ process.env.DSH_PROFILE_DIR = profileDir;
 process.env.DSH_PLUGIN_CLOUD_GIT_URL = sourceDir;
 
 // 真正的本地 registry：不是 mock fetchPackument，升级 handler 会按配置发 HTTP。
+let registryLatest = '1.1.0';
+const sourceOnlyNames = new Set();
 const registryRequests = [];
 const registryServer = createServer((req, res) => {
 	registryRequests.push(req.url);
 	if (req.url === '/custom-registry/registryPlugin') {
 		res.writeHead(200, { 'content-type': 'application/json' });
-		res.end(JSON.stringify({ 'dist-tags': { latest: '1.1.0' }, versions: { '1.1.0': {} } }));
+		res.end(JSON.stringify({ 'dist-tags': { latest: registryLatest }, versions: { [registryLatest]: {} } }));
 		return;
 	}
 	res.writeHead(404, { 'content-type': 'application/json' });
@@ -133,15 +135,22 @@ function makeManager() {
 			try { manifest = JSON.parse(await readFile(join(profileDir, 'package.json'), 'utf8')); } catch { /* use defaults */ }
 			const spec = manifest.dependencies?.[gitPlugin] ?? pinnedSpec;
 			const registrySpec = manifest.dependencies?.registryPlugin ?? '1.0.0';
+			// 真实 desktop manager 行只有 source，没有 spec/kind/installTarget。
+			const gitRow = sourceOnlyNames.has(gitPlugin)
+				? { name: gitPlugin, version: '1.0.0', source: spec, installed: true }
+				: { name: gitPlugin, version: '1.0.0', installed: true, enabled: true, spec };
+			const registryRow = sourceOnlyNames.has('registryPlugin')
+				? { name: 'registryPlugin', version: registrySpec, source: `registryPlugin@${registrySpec}`, installed: true }
+				: { name: 'registryPlugin', version: registrySpec, installed: true, enabled: true, spec: registrySpec };
 			return [
-				{ name: gitPlugin, version: '1.0.0', installed: true, enabled: true, spec },
-				{ name: 'registryPlugin', version: registrySpec, installed: true, enabled: true, spec: registrySpec },
+				gitRow,
+				registryRow,
 				{ name: 'pathPlugin', version: '1.0.0', installed: true, enabled: true, spec: 'file:../registryPlugin' },
 				{ name: 'unknownPlugin', version: '1.0.0', installed: true, enabled: true, spec: 'https://example.com/plugin.tgz' },
 			];
 		},
 		async installBundle(spec) {
-			const packageName = spec === 'registryPlugin@1.1.0' ? 'registryPlugin' : gitPlugin;
+			const packageName = spec.startsWith('registryPlugin@') ? 'registryPlugin' : gitPlugin;
 			const entry = join(profileDir, 'node_modules', packageName);
 			let entryExists = true;
 			try { await lstat(entry); } catch { entryExists = false; }
@@ -163,11 +172,11 @@ function makeManager() {
 			}
 			const manifestPath = join(profileDir, 'package.json');
 			const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
-			manifest.dependencies[packageName] = packageName === 'registryPlugin' ? '1.1.0' : spec;
+			manifest.dependencies[packageName] = packageName === 'registryPlugin' ? registryLatest : spec;
 			await writeFile(manifestPath, `${JSON.stringify(manifest, undefined, 2)}\n`, 'utf8');
 			await mkdir(entry, { recursive: true });
 			await writeFile(join(entry, 'package.json'), `${JSON.stringify({
-				name: packageName, version: packageName === 'registryPlugin' ? '1.1.0' : '1.0.0',
+				name: packageName, version: packageName === 'registryPlugin' ? registryLatest : '1.0.0',
 			})}\n`, 'utf8');
 			return { application: 'restart-required' };
 		},
@@ -386,6 +395,57 @@ for (const [name, errorCode] of [['pathPlugin', 'path-upgrade-blocked'], ['unkno
 	}
 	if (a.json?.job?.id) await waitJob(a.json.job.id);
 	if (b.json?.job?.id) await waitJob(b.json.job.id);
+}
+
+// ── 7. 真实 manager 只有 source：registry/git 都必须走真实安装链 ─────────────
+if (firstCommit !== null) {
+	await writeFile(join(sourceDir, 'source-only.txt'), 'third\n', 'utf8');
+	git('add', '-A');
+	git('commit', '-m', 'third');
+	const thirdCommit = git('rev-parse', 'HEAD');
+	git('update-ref', 'refs/remotes/origin/main', thirdCommit);
+	sourceOnlyNames.add(gitPlugin);
+	const sourceRow = (await fakeManager.listBundles()).find((row) => row.name === gitPlugin);
+	check('git 夹具只有 source，没有 spec/kind/installTarget',
+		sourceRow.source === `github:example/e2e#${secondCommit}`
+		&& !('spec' in sourceRow) && !('kind' in sourceRow) && !('installTarget' in sourceRow),
+		JSON.stringify(sourceRow));
+	const beforeCalls = fakeManager.calls.length;
+	const start = await request('POST', '/api/plugin-cloud/upgrade', { names: [gitPlugin] });
+	const final = start.json?.job?.id ? await waitJob(start.json.job.id) : null;
+	const row = (final?.results ?? [])[0] ?? {};
+	check('★ 只有 source 的 git 升级成功', row.ok === true && row.to === thirdCommit, JSON.stringify(row));
+	const call = fakeManager.calls.slice(beforeCalls).at(-1) ?? {};
+	check('★ 只有 source 的 git 实际安装新 commit', String(call.spec).includes(thirdCommit), JSON.stringify(call));
+	const manifest = JSON.parse(await readFile(join(profileDir, 'package.json'), 'utf8'));
+	check('只有 source 的 git 新 spec 写入 manifest', manifest.dependencies[gitPlugin] === `github:example/e2e#${thirdCommit}`,
+		String(manifest.dependencies[gitPlugin]));
+}
+
+{
+	registryLatest = '1.2.0';
+	sourceOnlyNames.add('registryPlugin');
+	const sourceRow = (await fakeManager.listBundles()).find((row) => row.name === 'registryPlugin');
+	check('registry 夹具只有 source，没有 spec/kind/installTarget',
+		sourceRow.source === 'registryPlugin@1.1.0'
+		&& !('spec' in sourceRow) && !('kind' in sourceRow) && !('installTarget' in sourceRow),
+		JSON.stringify(sourceRow));
+	const beforeRequests = registryRequests.length;
+	const beforeCalls = fakeManager.calls.length;
+	const start = await request('POST', '/api/plugin-cloud/upgrade', { names: ['registryPlugin'] });
+	const final = start.json?.job?.id ? await waitJob(start.json.job.id) : null;
+	const row = (final?.results ?? [])[0] ?? {};
+	check('★ 只有 source 的 registry 升级成功', row.ok === true && row.to === '1.2.0', JSON.stringify(row));
+	check('只有 source 的 registry 请求本地 registry', registryRequests.length === beforeRequests + 1,
+		JSON.stringify(registryRequests.slice(beforeRequests)));
+	const calls = fakeManager.calls.slice(beforeCalls).filter((call) => call.packageName === 'registryPlugin');
+	check('★ 只有 source 的 registry 实际执行 install/retry', calls.length === 2
+		&& calls.every((call) => call.spec === 'registryPlugin@1.2.0'), JSON.stringify(calls));
+	const manifest = JSON.parse(await readFile(join(profileDir, 'package.json'), 'utf8'));
+	const installed = JSON.parse(await readFile(join(profileDir, 'node_modules', 'registryPlugin', 'package.json'), 'utf8'));
+	check('只有 source 的 registry 新版本写入 manifest 和磁盘',
+		manifest.dependencies.registryPlugin === '1.2.0' && installed.version === '1.2.0',
+		JSON.stringify({ dependency: manifest.dependencies.registryPlugin, installed: installed.version }));
 }
 
 await new Promise((resolve) => registryServer.close(resolve));

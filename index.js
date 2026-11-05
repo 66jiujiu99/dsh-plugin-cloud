@@ -328,7 +328,7 @@ export function apply(ctx, rawConfig) {
 				// correctly marked "可更新" would have asked npm for a package that is
 				// not published there. Resolve per kind instead.
 				const current = (await (manager.listBundles?.() ?? [])).find((b) => b.name === name) ?? null;
-				const rawSpec = current?.spec ?? current?.installTarget?.spec;
+				const rawSpec = current?.spec ?? current?.installTarget?.spec ?? current?.source;
 				const currentSpec = String(rawSpec ?? "");
 				const classifiedKind = current?.kind ?? classifySpec(rawSpec);
 				const isGit = classifiedKind === "git" || (current?.kind === undefined && (
