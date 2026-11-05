@@ -98,7 +98,8 @@ await symlink(sourceDir, join(profileDir, 'node_modules', gitPlugin), 'junction'
 await mkdir(join(profileDir, 'node_modules', 'registryPlugin'), { recursive: true });
 await mkdir(join(profileDir, 'node_modules', guidePlugin), { recursive: true });
 
-process.env.DSH_VERSION = '0.2.1-rc.5';
+delete process.env.DSH_VERSION;
+process.env.DSH_CLIENT_VERSION = '0.2.1-rc.5';
 process.env.DSH_HOME = root;
 process.env.DSH_PROFILE = 'profile';
 process.env.DSH_PROFILE_DIR = profileDir;

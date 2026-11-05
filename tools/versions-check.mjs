@@ -64,6 +64,32 @@ const guidePackument = {
 		&& selected.incompatibleReasons.includes('node-incompatible'), JSON.stringify(selected));
 }
 {
+	const saved = {
+		DSH_VERSION: process.env.DSH_VERSION,
+		DSH_CLIENT_VERSION: process.env.DSH_CLIENT_VERSION,
+	};
+	try {
+		delete process.env.DSH_VERSION;
+		process.env.DSH_CLIENT_VERSION = '0.2.1-rc.5';
+		check('Desktop 仅有 DSH_CLIENT_VERSION 时读取当前版本', v.currentDshVersion() === '0.2.1-rc.5');
+		const desktop = v.resolveCompatibleVersion(guidePackument);
+		check('无 options 时 Desktop 回退仍选择 guide 0.4.0', desktop.version === '0.4.0', JSON.stringify(desktop));
+
+		process.env.DSH_VERSION = '0.2.2-rc.5';
+		check('DSH_VERSION 优先于 Desktop 注入值', v.currentDshVersion() === '0.2.2-rc.5');
+		const priority = v.resolveCompatibleVersion({
+			latest: '1.0.0', versions: ['1.0.0'],
+			manifests: { '1.0.0': { engines: { dsh: '>=0.2.2-0' } } },
+		});
+		check('无 options 时选择器使用优先的 DSH_VERSION', priority.version === '1.0.0', JSON.stringify(priority));
+	} finally {
+		for (const [key, value] of Object.entries(saved)) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	}
+}
+{
 	const nodeOnly = {
 		latest: '2.0.0', versions: ['1.0.0', '2.0.0'],
 		manifests: { '1.0.0': {}, '2.0.0': { engines: { node: '>=24.9' } } },
