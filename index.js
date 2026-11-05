@@ -29,7 +29,7 @@ import * as gh from "./lib/github.js";
 import * as store from "./lib/store.js";
 import { createScheduler, fingerprint } from "./lib/autobackup.js";
 import { restore, summarizeReport } from "./lib/restorer.js";
-import { checkUpdates, fetchPackument, githubSlug, remoteCommit } from "./lib/versions.js";
+import { checkUpdates, fetchPackument, githubSlug, remoteCommit, resolveCompatibleVersion } from "./lib/versions.js";
 import { planSubscription, BLOCKER_TEXT } from "./lib/subscriptions.js";
 import { replaceDependency } from "./lib/manifest.js";
 import { createJobRegistry, stepsFor, subscribeStepsFor, restoreStepsFor } from "./lib/jobs.js";
@@ -341,6 +341,7 @@ export function apply(ctx, rawConfig) {
 				}
 
 				let targetSpec = null;
+				let targetError = null;
 				if (isGit) {
 					const slug = githubSlug(currentSpec);
 					if (slug === null) throw new Error("unsupported-spec");
@@ -355,12 +356,15 @@ export function apply(ctx, rawConfig) {
 				} else {
 					const { registry } = await cfgNow();
 					const packument = await fetchPackument(name, registry);
-					row.to = packument?.latest ?? null;
+					const selection = resolveCompatibleVersion(packument);
+					row.to = selection.version;
 					row.spec = row.to === null ? null : `${name}@${row.to}`;
 					targetSpec = row.spec;
+					targetError = packument === null ? "registry-unreachable"
+						: selection.version === null ? "incompatible-version" : null;
 				}
 				jobs.advance(jobId, { index, stepIndex: 0, phase: "resolving" });
-				if (targetSpec === null) throw new Error(isGit ? "remote-unreachable" : "registry-unreachable");
+				if (targetSpec === null) throw new Error(isGit ? "remote-unreachable" : targetError ?? "registry-unreachable");
 
 				advance(1, "preparing");
 				row.from = current?.version ?? null;

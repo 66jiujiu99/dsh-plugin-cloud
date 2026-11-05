@@ -45,6 +45,7 @@ const root = await mkdtemp(join(tmpdir(), 'pc-e2e-up-'));
 const profileDir = join(root, 'profile');
 const sourceDir = join(root, 'git-src');
 const gitPlugin = 'git-e2e-plugin';
+const guidePlugin = 'dsh-plugin-guide';
 const remoteUrl = 'https://github.com/example/e2e.git';
 
 await mkdir(join(profileDir, 'node_modules'), { recursive: true });
@@ -82,10 +83,11 @@ await writeFile(join(profileDir, 'package.json'), `${JSON.stringify({
 	dependencies: {
 		[gitPlugin]: pinnedSpec,
 		registryPlugin: '1.0.0',
+		[guidePlugin]: '0.3.39',
 		pathPlugin: 'file:../registryPlugin',
 		unknownPlugin: 'https://example.com/plugin.tgz',
 	},
-	dsh: { profile: { bundles: [gitPlugin, 'registryPlugin'] } },
+	dsh: { profile: { bundles: [gitPlugin, 'registryPlugin', guidePlugin] } },
 }, undefined, 2)}\n`, 'utf8');
 await writeFile(join(profileDir, 'cordis.patch.yml'), '[]\n', 'utf8');
 // node_modules 里放 junction（指向源目录），这才是 `link:`/git 装出来的真实形态。
@@ -94,7 +96,9 @@ await writeFile(join(profileDir, 'cordis.patch.yml'), '[]\n', 'utf8');
 // 「目录还在」——一个永远成立的门票。
 await symlink(sourceDir, join(profileDir, 'node_modules', gitPlugin), 'junction');
 await mkdir(join(profileDir, 'node_modules', 'registryPlugin'), { recursive: true });
+await mkdir(join(profileDir, 'node_modules', guidePlugin), { recursive: true });
 
+process.env.DSH_VERSION = '0.2.1-rc.5';
 process.env.DSH_HOME = root;
 process.env.DSH_PROFILE = 'profile';
 process.env.DSH_PROFILE_DIR = profileDir;
@@ -110,7 +114,22 @@ const registryServer = createServer((req, res) => {
 	registryRequests.push(req.url);
 	if (req.url === '/custom-registry/registryPlugin') {
 		res.writeHead(200, { 'content-type': 'application/json' });
-		res.end(JSON.stringify({ 'dist-tags': { latest: registryLatest }, versions: { [registryLatest]: {} } }));
+			res.end(JSON.stringify({ 'dist-tags': { latest: registryLatest }, versions: { [registryLatest]: {} } }));
+		return;
+	}
+	if (req.url === `/custom-registry/${guidePlugin}`) {
+		const incompatible = { engines: { dsh: '>=0.2.2-0', node: '>=24.9' } };
+		res.writeHead(200, { 'content-type': 'application/json' });
+		res.end(JSON.stringify({
+			'dist-tags': { latest: '0.4.3' },
+			versions: {
+				'0.3.39': {},
+				'0.4.0': { engines: { dsh: '>=0.2.1-0 <0.3.0' } },
+				'0.4.1': incompatible,
+				'0.4.2': incompatible,
+				'0.4.3': incompatible,
+			},
+		}));
 		return;
 	}
 	res.writeHead(404, { 'content-type': 'application/json' });
@@ -145,12 +164,15 @@ function makeManager() {
 			return [
 				gitRow,
 				registryRow,
+				{ name: guidePlugin, version: '0.3.39', source: `${guidePlugin}@0.3.39`, installed: true },
 				{ name: 'pathPlugin', version: '1.0.0', installed: true, enabled: true, spec: 'file:../registryPlugin' },
 				{ name: 'unknownPlugin', version: '1.0.0', installed: true, enabled: true, spec: 'https://example.com/plugin.tgz' },
 			];
 		},
 		async installBundle(spec) {
-			const packageName = spec.startsWith('registryPlugin@') ? 'registryPlugin' : gitPlugin;
+			const packageName = spec.startsWith('registryPlugin@') ? 'registryPlugin'
+				: spec.startsWith(`${guidePlugin}@`) ? guidePlugin : gitPlugin;
+			const registryVersion = packageName === gitPlugin ? null : spec.slice(packageName.length + 1);
 			const entry = join(profileDir, 'node_modules', packageName);
 			let entryExists = true;
 			try { await lstat(entry); } catch { entryExists = false; }
@@ -164,7 +186,7 @@ function makeManager() {
 				}
 				return { application: 'restart-required', error: { code: 'e2e-install-failed' } };
 			}
-			if (packageName === 'registryPlugin' && entryExists) {
+			if (registryVersion !== null && entryExists) {
 				// 驱动真实 already-installed → drop → retry；失败安装同时清掉旧包，
 				// 第二次调用必须真的发生并写回 manifest，不能只伪造最终成功响应。
 				await rm(entry, { recursive: true, force: true });
@@ -172,11 +194,11 @@ function makeManager() {
 			}
 			const manifestPath = join(profileDir, 'package.json');
 			const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
-			manifest.dependencies[packageName] = packageName === 'registryPlugin' ? registryLatest : spec;
+			manifest.dependencies[packageName] = registryVersion ?? spec;
 			await writeFile(manifestPath, `${JSON.stringify(manifest, undefined, 2)}\n`, 'utf8');
 			await mkdir(entry, { recursive: true });
 			await writeFile(join(entry, 'package.json'), `${JSON.stringify({
-				name: packageName, version: packageName === 'registryPlugin' ? registryLatest : '1.0.0',
+				name: packageName, version: registryVersion ?? '1.0.0',
 			})}\n`, 'utf8');
 			return { application: 'restart-required' };
 		},
@@ -446,6 +468,26 @@ if (firstCommit !== null) {
 	check('只有 source 的 registry 新版本写入 manifest 和磁盘',
 		manifest.dependencies.registryPlugin === '1.2.0' && installed.version === '1.2.0',
 		JSON.stringify({ dependency: manifest.dependencies.registryPlugin, installed: installed.version }));
+}
+
+// dist-tag latest 不兼容当前 DSH/Node 时，实际升级必须落到最高兼容 stable。
+{
+	const beforeRequests = registryRequests.length;
+	const beforeCalls = fakeManager.calls.length;
+	const start = await request('POST', '/api/plugin-cloud/upgrade', { names: [guidePlugin] });
+	const final = start.json?.job?.id ? await waitJob(start.json.job.id) : null;
+	const row = (final?.results ?? [])[0] ?? {};
+	check('★ guide 0.3.39 升级到兼容的 0.4.0', row.ok === true && row.to === '0.4.0', JSON.stringify(row));
+	check('guide 升级读取带 engines 的真实形状 packument', registryRequests.slice(beforeRequests).includes(`/custom-registry/${guidePlugin}`),
+		JSON.stringify(registryRequests.slice(beforeRequests)));
+	const calls = fakeManager.calls.slice(beforeCalls).filter((call) => call.packageName === guidePlugin);
+	check('★ guide 实际 install/retry 都固定到 0.4.0', calls.length === 2
+		&& calls.every((call) => call.spec === `${guidePlugin}@0.4.0`), JSON.stringify(calls));
+	check('★ guide 从不尝试不兼容的 latest 0.4.3', calls.every((call) => call.spec !== `${guidePlugin}@0.4.3`), JSON.stringify(calls));
+	const manifest = JSON.parse(await readFile(join(profileDir, 'package.json'), 'utf8'));
+	const installed = JSON.parse(await readFile(join(profileDir, 'node_modules', guidePlugin, 'package.json'), 'utf8'));
+	check('guide 兼容版本写入 manifest 和磁盘', manifest.dependencies[guidePlugin] === '0.4.0' && installed.version === '0.4.0',
+		JSON.stringify({ dependency: manifest.dependencies[guidePlugin], installed: installed.version }));
 }
 
 await new Promise((resolve) => registryServer.close(resolve));

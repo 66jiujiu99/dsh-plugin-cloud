@@ -40,6 +40,62 @@ check('latestStable 跳过预发布', v.latestStable(['1.0.0', '2.0.0-beta', '1.
 check('latestStable 全预发布时返回 null', v.latestStable(['1.0.0-a', '1.0.0-b']) === null);
 check('latestStable 空数组返回 null', v.latestStable([]) === null);
 
+// ── 当前 DSH/Node 的最高兼容 stable ─────────────────────────
+const runtime = { dshVersion: '0.2.1-rc.5', nodeVersion: '22.14.0' };
+const guidePackument = {
+	latest: '0.4.3',
+	versions: ['0.3.39', '0.4.0', '0.4.1', '0.4.2', '0.4.3', '0.5.0-beta.1'],
+	manifests: {
+		'0.3.39': {},
+		'0.4.0': { engines: { dsh: '>=0.2.1-0 <0.3.0' } },
+		'0.4.1': { engines: { dsh: '>=0.2.2-0', node: '>=24.9' } },
+		'0.4.2': { engines: { dsh: '>=0.2.2-0', node: '>=24.9' } },
+		'0.4.3': { engines: { dsh: '>=0.2.2-0', node: '>=24.9' } },
+		'0.5.0-beta.1': {},
+	},
+};
+{
+	const selected = v.resolveCompatibleVersion(guidePackument, runtime);
+	check('guide 在 0.4.1+ 不兼容时选择 0.4.0', selected.version === '0.4.0', JSON.stringify(selected));
+	check('guide 选择器跳过更高的预发布版本', selected.version !== '0.5.0-beta.1', JSON.stringify(selected));
+	check('保留远端 latest=0.4.3', selected.remoteLatest === '0.4.3', JSON.stringify(selected));
+	check('明确标记 latest 不兼容', selected.incompatibleLatest === '0.4.3', JSON.stringify(selected));
+	check('保留 DSH 和 Node 不兼容原因', selected.incompatibleReasons.includes('dsh-incompatible')
+		&& selected.incompatibleReasons.includes('node-incompatible'), JSON.stringify(selected));
+}
+{
+	const nodeOnly = {
+		latest: '2.0.0', versions: ['1.0.0', '2.0.0'],
+		manifests: { '1.0.0': {}, '2.0.0': { engines: { node: '>=24.9' } } },
+	};
+	const selected = v.resolveCompatibleVersion(nodeOnly, runtime);
+	check('Node 不满足时回退到兼容版本', selected.version === '1.0.0', JSON.stringify(selected));
+	check('Node 不兼容原因可检查', selected.incompatibleReasons.includes('node-incompatible'), JSON.stringify(selected));
+}
+{
+	const invalid = {
+		latest: '2.0.0', versions: ['1.0.0', '2.0.0'],
+		manifests: { '1.0.0': {}, '2.0.0': { engines: { dsh: 'not a valid range' } } },
+	};
+	const selected = v.resolveCompatibleVersion(invalid, runtime);
+	check('非法 engines range 不得自动选中', selected.version === '1.0.0', JSON.stringify(selected));
+	check('非法 range 有明确原因', selected.incompatibleReasons.includes('dsh-range-invalid'), JSON.stringify(selected));
+	for (const [label, badRange] of [['null', null], ['空字符串', '']]) {
+		const undecidable = v.resolveCompatibleVersion({
+			latest: '2.0.0', versions: ['1.0.0', '2.0.0'],
+			manifests: { '1.0.0': {}, '2.0.0': { engines: { dsh: badRange } } },
+		}, runtime);
+		check(`${label} range 不得被宽松归一化后选中`, undecidable.version === '1.0.0', JSON.stringify(undecidable));
+	}
+	const unknown = v.resolveCompatibleVersion({ latest: '1.0.0', versions: ['1.0.0'], manifests: { '1.0.0': { engines: { dsh: '*' } } } },
+		{ dshVersion: null, nodeVersion: '22.14.0' });
+	check('DSH 版本未知时不把 range 当作兼容', unknown.version === null, JSON.stringify(unknown));
+	check('DSH 版本未知有明确原因', unknown.incompatibleReasons.includes('dsh-version-unknown'), JSON.stringify(unknown));
+	const legacy = v.resolveCompatibleVersion({ latest: '1.0.0', versions: ['1.0.0'], manifests: { '1.0.0': {} } },
+		{ dshVersion: null, nodeVersion: null });
+	check('无 engines 的旧包不受未知运行时影响', legacy.version === '1.0.0', JSON.stringify(legacy));
+}
+
 // ── updateStatus ────────────────────────────────────────────
 check('1.0.0 → 1.2.0 可更新', v.updateStatus('1.0.0', '1.2.0') === true);
 check('1.2.0 → 1.2.0 不可更新', v.updateStatus('1.2.0', '1.2.0') === false);
@@ -79,6 +135,23 @@ check('非法输入返回 null', v.githubSlug(null) === null);
 			versions: { '1.0.0': {} },
 			time: { '1.0.0': '2026-01-01T00:00:00.000Z' },
 		},
+		'dsh-plugin-guide': {
+			'dist-tags': { latest: '0.4.3' },
+			versions: guidePackument.manifests,
+			time: { '0.4.0': '2026-01-03T00:00:00.000Z', '0.4.3': '2026-01-04T00:00:00.000Z' },
+		},
+		'node-plugin': {
+			'dist-tags': { latest: '2.0.0' },
+			versions: { '1.0.0': {}, '2.0.0': { engines: { node: '>=24.9' } } },
+		},
+		'no-compatible-plugin': {
+			'dist-tags': { latest: '0.4.3' },
+			versions: {
+				'0.4.1': { engines: { dsh: '>=0.2.2-0' } },
+				'0.4.2': { engines: { dsh: '>=0.2.2-0' } },
+				'0.4.3': { engines: { dsh: '>=0.2.2-0' } },
+			},
+		},
 	};
 	const server = createServer((req, res) => {
 		if (req.url === '/registry-down') {
@@ -107,7 +180,10 @@ check('非法输入返回 null', v.githubSlug(null) === null);
 			{ name: 'registry-down', kind: 'registry', version: '1.0.0' },
 			{ name: 'fixture-plugin', kind: 'registry', version: '1.0.0' },
 			{ name: 'current-plugin', kind: 'registry', version: '1.0.0' },
-		], { registry });
+			{ name: 'dsh-plugin-guide', kind: 'registry', version: '0.3.39' },
+			{ name: 'node-plugin', kind: 'registry', version: '1.0.0' },
+			{ name: 'no-compatible-plugin', kind: 'registry', version: '0.3.39' },
+		], { registry, ...runtime });
 
 		const down = out.get('registry-down');
 		check('registry 503 标 remote-unreachable 而非 current', down?.note === 'remote-unreachable', JSON.stringify(down));
@@ -124,6 +200,36 @@ check('非法输入返回 null', v.githubSlug(null) === null);
 		check('网络成功且已最新时仍不可更新', current?.updateAvailable === false, JSON.stringify(current));
 		check('网络成功且已最新时 behind 仍为 0', current?.behind === 0, JSON.stringify(current));
 		check('网络成功时不新增失败 note', current !== undefined && !Object.hasOwn(current, 'note'), JSON.stringify(current));
+		check('无 engines 的旧包保持兼容且保留 remoteLatest', update?.remoteLatest === '2.0.0'
+			&& update !== undefined && !Object.hasOwn(update, 'incompatibleLatest'), JSON.stringify(update));
+
+		const guide = out.get('dsh-plugin-guide');
+		check('★ 检查更新选择 guide 0.4.0 而不是 0.4.3', guide?.latest === '0.4.0', JSON.stringify(guide));
+		check('guide 0.3.39 → 0.4.0 标可更新', guide?.updateAvailable === true, JSON.stringify(guide));
+		check('guide 保留 remoteLatest 和 incompatibleLatest', guide?.remoteLatest === '0.4.3'
+			&& guide?.incompatibleLatest === '0.4.3', JSON.stringify(guide));
+		check('guide 不兼容信息不覆盖可更新状态', guide?.note === 'incompatible-latest'
+			&& guide?.incompatibleReasons?.includes('dsh-incompatible'), JSON.stringify(guide));
+		check('发布时间对应兼容目标而非远端 latest', guide?.publishedAt === '2026-01-03T00:00:00.000Z', JSON.stringify(guide));
+
+		const node = out.get('node-plugin');
+		check('Node 不兼容时检查更新回退且不误报更新', node?.latest === '1.0.0' && node?.updateAvailable === false, JSON.stringify(node));
+		check('Node 不兼容仍保留远端版本与原因', node?.remoteLatest === '2.0.0'
+			&& node?.incompatibleReasons?.includes('node-incompatible'), JSON.stringify(node));
+
+		const blocked = out.get('no-compatible-plugin');
+		check('完全无兼容版本时不伪造升级目标', blocked?.latest === null && blocked?.updateAvailable === false, JSON.stringify(blocked));
+		check('完全无兼容版本仍保留远端更高版本', blocked?.remoteLatest === '0.4.3'
+			&& blocked?.incompatibleLatest === '0.4.3', JSON.stringify(blocked));
+
+		const atCompatible = await v.checkUpdates([
+			{ name: 'dsh-plugin-guide', kind: 'registry', version: '0.4.0' },
+		], { registry, ...runtime });
+		const noNewer = atCompatible.get('dsh-plugin-guide');
+		check('已在最高兼容版本时 updateAvailable=false', noNewer?.latest === '0.4.0'
+			&& noNewer?.updateAvailable === false, JSON.stringify(noNewer));
+		check('无兼容新版不等于远端没有更高版本', noNewer?.remoteLatest === '0.4.3'
+			&& noNewer?.incompatibleLatest === '0.4.3', JSON.stringify(noNewer));
 	} finally {
 		await new Promise((resolve, reject) => {
 			server.close((error) => error ? reject(error) : resolve());
