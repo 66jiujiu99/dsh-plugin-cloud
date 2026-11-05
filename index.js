@@ -180,7 +180,7 @@ export function apply(ctx, rawConfig) {
 		const cfg = await cfgNow();
 		// Record *why* this version exists so the version list can say it.
 		if (typeof detail === "string" && detail !== "") snap.reasonDetail = detail.slice(0, 120);
-		await store.saveLocal(snap);
+		await store.saveLocal(snap, { keep: cfg.maxSnapshots });
 		if (!cloudReady(cfg)) {
 			lastPush = { at: new Date().toISOString(), where: "local", reason, error: null };
 			return;
@@ -689,7 +689,7 @@ export function apply(ctx, rawConfig) {
 							configLoadError: cfgLoadError,
 							cloud,
 							token: tokenInfo,
-							versionCount: store.mergeIndexes(local.versions, remote.versions).length,
+							versionCount: store.mergeIndexes(local.versions, remote.versions).slice(0, cfg.maxSnapshots).length,
 							auto: scheduler.status(),
 							lastPush,
 							lastChange,
@@ -711,7 +711,7 @@ export function apply(ctx, rawConfig) {
 							}
 						}
 						writeJson(res, 200, {
-							versions: store.mergeIndexes(local.versions, remote.versions),
+							versions: store.mergeIndexes(local.versions, remote.versions).slice(0, cfg.maxSnapshots),
 							cloudError: error,
 						});
 						return;
@@ -852,11 +852,15 @@ export function apply(ctx, rawConfig) {
 							// A settings change does not change the plugin set, so it
 							// must not force a snapshot; only re-arm the timer.
 							scheduler.reschedule();
+							// Saving the same value is also an explicit request to converge old files.
+							const localPrune = Object.hasOwn(body, "maxSnapshots")
+								? await store.pruneLocal(result.config.maxSnapshots)
+								: null;
 							if (result.rejected.length > 0) {
-								writeJson(res, 400, { error: `字段被拒绝: ${result.rejected.join(", ")}`, config: result.config });
+								writeJson(res, 400, { error: `字段被拒绝: ${result.rejected.join(", ")}`, config: result.config, localPrune });
 								return;
 							}
-							writeJson(res, 200, { saved: true, config: result.config, path: result.path });
+							writeJson(res, 200, { saved: true, config: result.config, path: result.path, localPrune });
 						} catch (error) {
 							writeJson(res, 500, { error: String(error?.message ?? error).slice(0, 300) });
 						}

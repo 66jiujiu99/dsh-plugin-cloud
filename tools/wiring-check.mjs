@@ -257,4 +257,14 @@ const jobsRaw = await readFile(join(ROOT, 'lib', 'jobs.js'), 'utf8');
 	check('push-unverified blocker 已接线', clientRaw.includes("'push-unverified': 'blockPushUnverified'"));
 }
 
+// ── 16. 本地与合并列表都应用 maxSnapshots ─────────────────────
+{
+	check('保存快照把 maxSnapshots 传给本地保留', hostRaw.includes('store.saveLocal(snap, { keep: cfg.maxSnapshots })'));
+	check('同值保存 maxSnapshots 也触发本地 prune',
+		hostRaw.includes('Object.hasOwn(body, "maxSnapshots")')
+		&& hostRaw.includes('await store.pruneLocal(result.config.maxSnapshots)'));
+	const caps = hostRaw.match(/store\.mergeIndexes\(local\.versions, remote\.versions\)\.slice\(0, cfg\.maxSnapshots\)/g) ?? [];
+	check('status 与 versions 都截断合并后的列表', caps.length === 2, String(caps.length));
+}
+
 console.log(`\n${passed} checks passed`);
